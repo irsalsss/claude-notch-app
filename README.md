@@ -4,6 +4,14 @@ ClaudeNotch is a small macOS app that shows Claude Code status around the MacBoo
 
 claude-swap is a command-line tool that runs Claude Code with more than one account. ClaudeNotch reads the data of claude-swap. It does not change that data.
 
+## Demo video
+
+The video shows the collapsed state, the expanded state, and a click that opens the terminal of a session. The video is 31 seconds long and has no sound. The session names in the video are blurred.
+
+[![The expanded state of ClaudeNotch, with the usage of four accounts](docs/demo-poster.png)](docs/demo.mp4)
+
+To play the video, click the image. The file is [docs/demo.mp4](docs/demo.mp4).
+
 ## What the app shows
 
 The app has two states. The collapsed state is a black strip around the notch. When you move the pointer over the notch, the expanded state opens. When you move the pointer away, it closes.
