@@ -1,0 +1,19 @@
+# Build output (build.sh writes the app to ~/Applications, but keep local builds out too)
+*.app/
+build/
+.build/
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# Secrets and local overrides: never commit these
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.mobileprovision
+credentials*.json
+.credentials.json
