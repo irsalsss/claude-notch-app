@@ -20,12 +20,13 @@ The collapsed state shows these items:
 
 - The Claude mark, on the left of the notch. If no session is working, the mark does not move.
 - A number next to the mark. If one or more sessions are working, the mark turns and the number shows the count of working sessions.
+- A blue dot that pulses, with a count. The dot shows when one or more sessions wait for your answer, for example a question from Claude or a permission prompt.
 - One small bar for each account, on the right of the notch. Each bar shows the 5-hour usage of that account.
 - The 5-hour usage of the default account, as a percentage next to the bars.
 
 The default account is the account that a plain `claude` command uses. claude-swap keeps the credentials of this account in `~/.claude`. A terminal tab that you start with `claude-swap run N` uses account `N` instead.
 
-The expanded state shows a list of the working sessions. For each session, the list shows the session name, the folder, and the account number. Below the list, a card for each account shows the 5-hour limit, the 7-day limit, and the time until each limit resets.
+The expanded state shows a blue list of the sessions that wait for your answer. Each row says `question` or `permission`. Below it, the expanded state shows a list of the working sessions. For each session, the list shows the session name, the folder, and the account number. Below the list, a card for each account shows the 5-hour limit, the 7-day limit, and the time until each limit resets.
 
 If you turn on Reduce Motion in System Settings, the mark does not turn. A glow around the mark then shows that a session is working.
 
@@ -121,7 +122,7 @@ The script stops the running copy of the app and starts the new build. You do no
 
 The app reads the usage data from claude-swap. It runs `claude-swap list --json` every 60 seconds. It also runs the command each time that the expanded state opens.
 
-The app reads the session activity from files that Claude Code writes. Claude Code writes one file, `sessions/<pid>.json`, for each running session. Each file has a `status` field with the value `busy` or `idle`. The app reads these files every second.
+The app reads the session activity from files that Claude Code writes. Claude Code writes one file, `sessions/<pid>.json`, for each running session. Each file has a `status` field with the value `busy`, `idle`, or `waiting`. A `waiting` file also has a `waitingFor` field. The value `input needed` is a question, and the values `permission prompt`, `sandbox request`, `worker request`, and `goal proposal` are permission requests. The value `dialog open` is a dialog that you opened yourself, so the app does not count it. The app reads these files every second.
 
 The session files are in two places. Sessions that use the default account are in `~/.claude/sessions`. Sessions that you start with `claude-swap run N` are in `~/.claude-swap-backup/sessions/<N-email>/sessions`.
 

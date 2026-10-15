@@ -1,12 +1,13 @@
 // ClaudeNotch: hover the MacBook notch to see Claude usage for every claude-swap account.
 // Data sources:
 //   usage    `claude-swap list --json` (uses claude-swap's own usage cache and polling)
-//   activity Claude Code's own `sessions/<pid>.json` files, which carry `status: busy | idle`,
+//   activity Claude Code's own `sessions/<pid>.json` files, which carry `status: busy | idle | waiting`,
 //            read from ~/.claude/sessions and every ~/.claude-swap-backup/sessions/<N-email>/sessions.
 import AppKit
 import SwiftUI
 
 let claudeOrange = Color(red: 0.851, green: 0.467, blue: 0.341)  // #D97757
+let askBlue = Color(red: 0.353, green: 0.659, blue: 1.0)  // #5AA8FF: a session waits for your answer
 
 // MARK: - Data
 
@@ -15,9 +16,14 @@ struct Session: Identifiable, Equatable {
     let name: String
     let cwd: String
     let status: String
+    let waitingFor: String?
     let account: Int?  // nil: a plain `claude` on ~/.claude, which runs as claude-swap's default account
     var id: Int32 { pid }
-    var working: Bool { status != "idle" }
+    // `waiting` with "dialog open" is a dialog you opened yourself (a slash command), not Claude asking.
+    var needsYou: Bool { status == "waiting" && waitingFor != "dialog open" }
+    var working: Bool { status != "idle" && status != "waiting" }
+    // Claude Code's own grouping: "input needed" is a question, every other wait is a permission.
+    var ask: String { waitingFor == "input needed" ? "question" : "permission" }
     var folder: String { (cwd as NSString).lastPathComponent }
 }
 
@@ -26,6 +32,7 @@ private struct SessionFile: Decodable {
     let name: String?
     let cwd: String?
     let status: String?
+    let waitingFor: String?
 }
 
 struct Limit: Decodable {
@@ -70,16 +77,19 @@ final class Model: ObservableObject {
 
     var active: Account? { accounts.first(where: \.active) }
     var working: [Session] { sessions.filter(\.working) }
+    var needsYou: [Session] { sessions.filter(\.needsYou) }
 
     func workingCount(account: Int) -> Int { working.filter { accountOf($0) == account }.count }
+    func needsYouCount(account: Int) -> Int { needsYou.filter { accountOf($0) == account }.count }
 
     // claude-swap's `active` is the account holding ~/.claude: the one a plain `claude` uses,
     // while `claude-swap run N` tabs carry their own config dir.
     func accountOf(_ s: Session) -> Int? { s.account ?? active?.number }
 
-    // Working sessions first, so the first click lands where Claude is busy.
+    // Sessions waiting for you first, then working ones, so the first click lands where you are needed.
     func sessions(account: Int) -> [Session] {
-        sessions.filter { accountOf($0) == account }.sorted { ($0.working ? 0 : 1, $0.name) < ($1.working ? 0 : 1, $1.name) }
+        func rank(_ s: Session) -> Int { s.needsYou ? 0 : s.working ? 1 : 2 }
+        return sessions.filter { accountOf($0) == account }.sorted { (rank($0), $0.name) < (rank($1), $1.name) }
     }
 
     // Each click on the same account steps to its next open session.
@@ -125,7 +135,7 @@ final class Model: ObservableObject {
                       let s = try? JSONDecoder().decode(SessionFile.self, from: data),
                       isAlive(s.pid), seen.insert(s.pid).inserted else { continue }
                 out.append(Session(pid: s.pid, name: s.name ?? "pid \(s.pid)", cwd: s.cwd ?? "",
-                                   status: s.status ?? "idle", account: dir.account))
+                                   status: s.status ?? "idle", waitingFor: s.waitingFor, account: dir.account))
             }
         }
         return out.sorted { ($0.account ?? 0, $0.name) < ($1.account ?? 0, $1.name) }
@@ -395,6 +405,62 @@ final class MarkView: NSView {
     }
 }
 
+// A dot that pulses while a session waits for you. Reduced motion keeps it lit and still.
+struct PulseDot: NSViewRepresentable {
+    let size: CGFloat
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeNSView(context: Context) -> PulseView { PulseView() }
+    func updateNSView(_ view: PulseView, context: Context) { view.set(animating: !reduceMotion) }
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: PulseView, context: Context) -> CGSize? {
+        CGSize(width: size, height: size)
+    }
+}
+
+final class PulseView: NSView {
+    private let dot = CALayer()
+    private var animating = false
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        dot.backgroundColor = NSColor(askBlue).cgColor
+        dot.shadowColor = NSColor(askBlue).cgColor
+        dot.shadowOffset = .zero
+        dot.shadowOpacity = 0.9
+        layer?.addSublayer(dot)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        dot.frame = bounds
+        dot.cornerRadius = bounds.width / 2
+        dot.shadowRadius = bounds.width * 0.5
+        restart()
+    }
+
+    func set(animating: Bool) {
+        guard animating != self.animating else { return }
+        self.animating = animating
+        restart()
+    }
+
+    private func restart() {
+        dot.removeAllAnimations()
+        guard animating, bounds.width > 0 else { return }
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 1
+        pulse.toValue = 0.3
+        pulse.duration = 0.8
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.isRemovedOnCompletion = false
+        dot.add(pulse, forKey: "pulse")
+    }
+}
+
 struct Meter: View {
     let title: String
     let limit: Limit?  // nil: the API sent no data for this window
@@ -470,6 +536,7 @@ struct OpenHint: View {
 struct AccountRow: View {
     let account: Account
     let working: Int
+    let waiting: Int
     let targets: [Session]  // open sessions of this account, working first
     let onOpen: () -> Void
     @State private var hovering = false
@@ -477,7 +544,7 @@ struct AccountRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var clickable: Bool { !targets.isEmpty }
-    private var accent: Color { working > 0 ? claudeOrange : .white }
+    private var accent: Color { waiting > 0 ? askBlue : working > 0 ? claudeOrange : .white }
     private var lit: Bool { hovering && clickable }
 
     var body: some View {
@@ -494,6 +561,7 @@ struct AccountRow: View {
                         Chip(text: "default", tint: .green)
                             .help("Account in ~/.claude: what a plain `claude` runs as. `claude-swap run N` tabs use their own.")
                     }
+                    if waiting > 0 { Chip(text: "\(waiting) waiting", tint: askBlue) }
                     if working > 0 { Chip(text: "\(working) working", tint: claudeOrange) }
                     Spacer(minLength: 4)
                     if let status = account.usageStatus, status != "ok" {
@@ -547,16 +615,22 @@ struct SessionRow: View {
     let onOpen: () -> Void
     @State private var hovering = false
 
+    private var tint: Color { session.needsYou ? askBlue : claudeOrange }
+    // A waiting session names what it waits for; a working one only names an unusual status.
+    private var label: String? {
+        session.needsYou ? session.ask : session.status != "busy" ? session.status : nil
+    }
+
     var body: some View {
         Button(action: onOpen) {
             HStack(spacing: 7) {
-                Circle().fill(claudeOrange).frame(width: 5, height: 5)
-                    .shadow(color: claudeOrange.opacity(hovering ? 0.9 : 0), radius: 3)
+                Circle().fill(tint).frame(width: 5, height: 5)
+                    .shadow(color: tint.opacity(hovering ? 0.9 : 0), radius: 3)
                 Text(session.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
                 Text(session.folder).font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.45)).lineLimit(1)
                 Spacer()
-                if session.status != "busy" {
-                    Text(session.status).font(.system(size: 9.5)).foregroundStyle(claudeOrange.opacity(0.85))
+                if let label {
+                    Text(label).font(.system(size: 9.5)).foregroundStyle(tint.opacity(0.85))
                 }
                 if let n = account {
                     Text("#\(n)").font(.system(size: 9.5, weight: .medium).monospacedDigit())
@@ -564,11 +638,11 @@ struct SessionRow: View {
                 }
                 Image(systemName: "arrow.up.right")
                     .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(claudeOrange)
+                    .foregroundStyle(tint)
                     .opacity(hovering ? 1 : 0)
             }
             .padding(.horizontal, 6).padding(.vertical, 3)
-            .background(RoundedRectangle(cornerRadius: 6).fill(claudeOrange.opacity(hovering ? 0.14 : 0)))
+            .background(RoundedRectangle(cornerRadius: 6).fill(tint.opacity(hovering ? 0.14 : 0)))
             .contentShape(RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(PressStyle())
@@ -593,15 +667,18 @@ struct RootView: View {
             .onGeometryChange(for: CGSize.self) { $0.size } action: { model.contentSize = $0 }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.working)
+            .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.needsYou)
     }
 
     @ViewBuilder private var content: some View {
         if model.expanded {
             VStack(alignment: .leading, spacing: 10) {
                 header
-                if !model.working.isEmpty { sessions }
+                if !model.needsYou.isEmpty { sessionList(model.needsYou, tint: askBlue) }
+                if !model.working.isEmpty { sessionList(model.working, tint: claudeOrange) }
                 ForEach(model.accounts) { a in
                     AccountRow(account: a, working: model.workingCount(account: a.number),
+                               waiting: model.needsYouCount(account: a.number),
                                targets: model.sessions(account: a.number)) { model.open(account: a.number) }
                 }
                 HStack {
@@ -637,23 +714,33 @@ struct RootView: View {
 
     private var header: some View {
         let n = model.working.count
+        let w = model.needsYou.count
         return HStack(spacing: 10) {
             ClaudeLogo(working: n > 0, size: 22)
             VStack(alignment: .leading, spacing: 1) {
                 Text("Claude").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
-                Text(n > 0 ? "Working · \(n) session\(n == 1 ? "" : "s")" : "Idle")
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(n > 0 ? claudeOrange : .white.opacity(0.45))
-                    .contentTransition(.opacity)
+                HStack(spacing: 6) {
+                    if w > 0 {
+                        Text("Waiting for you · \(w)").foregroundStyle(askBlue)
+                    }
+                    if n > 0 {
+                        Text("Working · \(n) session\(n == 1 ? "" : "s")").foregroundStyle(claudeOrange)
+                    }
+                    if w == 0 && n == 0 {
+                        Text("Idle").foregroundStyle(.white.opacity(0.45))
+                    }
+                }
+                .font(.system(size: 10.5, weight: .medium))
+                .contentTransition(.opacity)
             }
             Spacer()
         }
         .padding(.bottom, 2)
     }
 
-    private var sessions: some View {
-        let shown = model.working.prefix(Self.maxSessions)
-        let rest = model.working.count - shown.count
+    private func sessionList(_ list: [Session], tint: Color) -> some View {
+        let shown = list.prefix(Self.maxSessions)
+        let rest = list.count - shown.count
         return VStack(alignment: .leading, spacing: 2) {
             ForEach(shown) { s in SessionRow(session: s, account: model.accountOf(s)) { model.open(s) } }
             if rest > 0 {
@@ -661,18 +748,29 @@ struct RootView: View {
             }
         }
         .padding(4)
-        .background(RoundedRectangle(cornerRadius: 10).fill(claudeOrange.opacity(0.08)))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(claudeOrange.opacity(0.22), lineWidth: 1))
+        .background(RoundedRectangle(cornerRadius: 10).fill(tint.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(tint.opacity(0.22), lineWidth: 1))
         .transition(.opacity.combined(with: .move(edge: .top)))
     }
 
-    // Left of the notch: the Claude mark, and how many sessions are working right now.
+    // Left of the notch: the Claude mark, how many sessions are working, and a pulsing blue dot
+    // with a count when a session waits for your answer.
     private var statusWing: some View {
         let n = model.working.count
+        let w = model.needsYou.count
         return HStack(spacing: 5) {
             ClaudeLogo(working: n > 0, size: 16)
             if n > 0 {
                 Text("\(n)").foregroundStyle(claudeOrange).transition(.opacity.combined(with: .scale))
+            }
+            if w > 0 {
+                HStack(spacing: 3) {
+                    PulseDot(size: 6)
+                    Text("\(w)").foregroundStyle(askBlue)
+                }
+                .transition(.opacity.combined(with: .scale))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(w) session\(w == 1 ? "" : "s") waiting for you")
             }
         }
         .frame(width: Self.wing)
