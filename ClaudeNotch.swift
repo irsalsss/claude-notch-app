@@ -62,8 +62,11 @@ final class Model: ObservableObject {
     @Published var expanded = false
     @Published var contentSize: CGSize = .zero
     @Published var sessions: [Session] = []
+    @Published var notice: String?
 
     private var loading = false
+    private var cycle: [Int: Int] = [:]
+    private var noticeWork: DispatchWorkItem?
 
     var active: Account? { accounts.first(where: \.active) }
     var working: [Session] { sessions.filter(\.working) }
@@ -73,6 +76,29 @@ final class Model: ObservableObject {
     // claude-swap's `active` is the account holding ~/.claude: the one a plain `claude` uses,
     // while `claude-swap run N` tabs carry their own config dir.
     func accountOf(_ s: Session) -> Int? { s.account ?? active?.number }
+
+    // Working sessions first, so the first click lands where Claude is busy.
+    func sessions(account: Int) -> [Session] {
+        sessions.filter { accountOf($0) == account }.sorted { ($0.working ? 0 : 1, $0.name) < ($1.working ? 0 : 1, $1.name) }
+    }
+
+    // Each click on the same account steps to its next open session.
+    func open(account: Int) {
+        let list = sessions(account: account)
+        guard !list.isEmpty else { return }
+        let i = cycle[account, default: 0] % list.count
+        cycle[account] = i + 1
+        open(list[i])
+    }
+
+    func open(_ s: Session) {
+        guard let problem = TerminalFocus.focus(pid: s.pid) else { return }
+        noticeWork?.cancel()
+        notice = problem
+        let work = DispatchWorkItem { [weak self] in self?.notice = nil }
+        noticeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+    }
 
     func refreshSessions() {
         DispatchQueue.global(qos: .utility).async {
@@ -143,6 +169,104 @@ final class Model: ObservableObject {
             return .success(try JSONDecoder().decode(Payload.self, from: data).accounts)
         } catch {
             return .failure(error)
+        }
+    }
+}
+
+// MARK: - Terminal focus
+
+// Finds the terminal app that owns a session's pid and brings that window to the front.
+// iTerm2 and Terminal.app expose their tabs to AppleScript, so the tab with the session's tty is
+// selected. Other terminals (Warp, Ghostty) have no tab API, so the app itself comes forward.
+enum TerminalFocus {
+    private static func info(_ pid: Int32) -> kinfo_proc? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        return info
+    }
+
+    static func tty(_ pid: Int32) -> String? {
+        guard let dev = info(pid)?.kp_eproc.e_tdev, dev != -1, let name = devname(dev, S_IFCHR) else { return nil }
+        return "/dev/" + String(cString: name)
+    }
+
+    // The first ancestor that is a regular app: iTerm2 above its iTermServer, Warp above its shell.
+    static func app(_ pid: Int32) -> NSRunningApplication? {
+        var p = pid
+        for _ in 0..<16 {
+            if let app = NSRunningApplication(processIdentifier: p), app.activationPolicy == .regular { return app }
+            guard let parent = info(p)?.kp_eproc.e_ppid, parent > 1 else { return nil }
+            p = parent
+        }
+        return nil
+    }
+
+    // nil when the terminal came forward; otherwise a short message for the footer.
+    static func focus(pid: Int32) -> String? {
+        guard let app = app(pid) else { return "Could not find the terminal for this session" }
+        let name = app.localizedName ?? "the terminal"
+        if let tty = tty(pid), let script = script(bundle: app.bundleIdentifier, tty: tty) {
+            var err: NSDictionary?
+            let result = NSAppleScript(source: script)?.executeAndReturnError(&err)
+            if result?.booleanValue == true { return nil }
+            if (err?[NSAppleScript.errorNumber] as? Int) == -1743 {
+                bringForward(app)
+                return "Allow ClaudeNotch to control \(name): System Settings › Privacy › Automation"
+            }
+        }
+        bringForward(app)
+        return nil
+    }
+
+    // A background app cannot activate another one directly since macOS 14; a launch request can.
+    private static func bringForward(_ app: NSRunningApplication) {
+        guard let url = app.bundleURL else { return }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.openApplication(at: url, configuration: config)
+    }
+
+    private static func script(bundle: String?, tty: String) -> String? {
+        switch bundle {
+        case "com.googlecode.iterm2":
+            return """
+            tell application id "com.googlecode.iterm2"
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        repeat with s in sessions of t
+                            if tty of s is "\(tty)" then
+                                select w
+                                select t
+                                select s
+                                activate
+                                return true
+                            end if
+                        end repeat
+                    end repeat
+                end repeat
+            end tell
+            return false
+            """
+        case "com.apple.Terminal":
+            return """
+            tell application id "com.apple.Terminal"
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        if tty of t is "\(tty)" then
+                            set selected of t to true
+                            set index of w to 1
+                            activate
+                            return true
+                        end if
+                    end repeat
+                end repeat
+            end tell
+            return false
+            """
+        default:
+            return nil
         }
     }
 }
@@ -299,62 +423,159 @@ struct Meter: View {
     }
 }
 
+// Presses sink a touch; reduced motion keeps the colour change and drops the scale.
+struct PressStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.975 : 1)
+            .brightness(configuration.isPressed ? 0.06 : 0)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+struct Chip: View {
+    let text: String
+    let tint: Color
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 9.5, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 6).padding(.vertical, 1.5)
+            .background(Capsule().fill(tint.opacity(0.15)))
+    }
+}
+
+// "iTerm2 ↗" on hover: where a click goes.
+struct OpenHint: View {
+    let app: String
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "terminal")
+            Text(app)
+            Image(systemName: "arrow.up.right")
+        }
+        .font(.system(size: 9.5, weight: .semibold))
+        .foregroundStyle(tint)
+        .padding(.horizontal, 7).padding(.vertical, 2)
+        .background(Capsule().fill(tint.opacity(0.16)))
+        .overlay(Capsule().strokeBorder(tint.opacity(0.3), lineWidth: 0.5))
+    }
+}
+
 struct AccountRow: View {
     let account: Account
     let working: Int
+    let targets: [Session]  // open sessions of this account, working first
+    let onOpen: () -> Void
+    @State private var hovering = false
+    @State private var app: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var clickable: Bool { !targets.isEmpty }
+    private var accent: Color { working > 0 ? claudeOrange : .white }
+    private var lit: Bool { hovering && clickable }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Text("\(account.number) · \(account.label)").font(.system(size: 12, weight: .semibold))
-                if account.active {
-                    Text("default")
-                        .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(.green)
-                        .padding(.horizontal, 6).padding(.vertical, 1.5)
-                        .background(Capsule().fill(Color.green.opacity(0.14)))
-                        .help("Account in ~/.claude: what a plain `claude` runs as. `claude-swap run N` tabs use their own.")
+        Button(action: onOpen) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text("\(account.number)")
+                        .font(.system(size: 10.5, weight: .bold).monospacedDigit())
+                        .foregroundStyle(lit ? .black : .white.opacity(0.75))
+                        .frame(width: 18, height: 18)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(lit ? accent : .white.opacity(0.1)))
+                    Text(account.label).font(.system(size: 12, weight: .semibold))
+                    if account.active {
+                        Chip(text: "default", tint: .green)
+                            .help("Account in ~/.claude: what a plain `claude` runs as. `claude-swap run N` tabs use their own.")
+                    }
+                    if working > 0 { Chip(text: "\(working) working", tint: claudeOrange) }
+                    Spacer(minLength: 4)
+                    if let status = account.usageStatus, status != "ok" {
+                        Text(status).font(.system(size: 10)).foregroundStyle(.orange)
+                    }
+                    if lit, let app {
+                        OpenHint(app: targets.count > 1 ? "\(app) · \(targets.count)" : app, tint: accent)
+                            .transition(.opacity.combined(with: .offset(x: reduceMotion ? 0 : 6)))
+                    } else if hovering && !clickable {
+                        Text("no open session")
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.35))
+                            .transition(.opacity)
+                    }
                 }
-                if working > 0 {
-                    Text("\(working) working")
-                        .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(claudeOrange)
-                        .padding(.horizontal, 6).padding(.vertical, 1.5)
-                        .background(Capsule().fill(claudeOrange.opacity(0.16)))
-                }
-                Spacer()
-                if let status = account.usageStatus, status != "ok" {
-                    Text(status).font(.system(size: 10)).foregroundStyle(.orange)
-                }
+                .frame(height: 18)
+                .foregroundStyle(.white)
+                Meter(title: "5h", limit: account.usage?.fiveHour)
+                // Team-plan seats report no 7d window, so the row only shows when the API sends one.
+                if let w = account.usage?.sevenDay { Meter(title: "7d", limit: w) }
             }
-            .foregroundStyle(.white)
-            Meter(title: "5h", limit: account.usage?.fiveHour)
-            // Team-plan seats report no 7d window, so the row only shows when the API sends one.
-            if let w = account.usage?.sevenDay { Meter(title: "7d", limit: w) }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(background)))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(lit ? accent.opacity(0.45) : .clear, lineWidth: 1))
+            .shadow(color: lit ? accent.opacity(0.22) : .clear, radius: 10)
+            .scaleEffect(lit && !reduceMotion ? 1.012 : 1)
+            .contentShape(RoundedRectangle(cornerRadius: 10))
         }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(account.active ? 0.07 : 0.03)))
+        .buttonStyle(PressStyle())
+        .disabled(!clickable)
+        .onHover { inside in
+            if inside, let first = targets.first { app = TerminalFocus.app(first.pid)?.localizedName ?? "Terminal" }
+            hovering = inside
+        }
+        .pointerStyle(clickable ? .link : nil)
+        .animation(.easeOut(duration: 0.16), value: hovering)
+        .help(targets.count > 1 ? "Click to open its terminal. Click again for the next of \(targets.count) sessions." : "")
+        .accessibilityLabel("Account \(account.number), \(account.label)")
+        .accessibilityHint(clickable ? "Opens its terminal" : "No open session")
+    }
+
+    private var background: Double {
+        let base = account.active ? 0.07 : 0.03
+        return hovering ? base + (clickable ? 0.06 : 0.02) : base
     }
 }
 
 struct SessionRow: View {
     let session: Session
     let account: Int?
+    let onOpen: () -> Void
+    @State private var hovering = false
 
     var body: some View {
-        HStack(spacing: 7) {
-            Circle().fill(claudeOrange).frame(width: 5, height: 5)
-            Text(session.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
-            Text(session.folder).font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.45)).lineLimit(1)
-            Spacer()
-            if session.status != "busy" {
-                Text(session.status).font(.system(size: 9.5)).foregroundStyle(claudeOrange.opacity(0.85))
+        Button(action: onOpen) {
+            HStack(spacing: 7) {
+                Circle().fill(claudeOrange).frame(width: 5, height: 5)
+                    .shadow(color: claudeOrange.opacity(hovering ? 0.9 : 0), radius: 3)
+                Text(session.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
+                Text(session.folder).font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.45)).lineLimit(1)
+                Spacer()
+                if session.status != "busy" {
+                    Text(session.status).font(.system(size: 9.5)).foregroundStyle(claudeOrange.opacity(0.85))
+                }
+                if let n = account {
+                    Text("#\(n)").font(.system(size: 9.5, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.4))
+                }
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(claudeOrange)
+                    .opacity(hovering ? 1 : 0)
             }
-            if let n = account {
-                Text("#\(n)").font(.system(size: 9.5, weight: .medium).monospacedDigit())
-                    .foregroundStyle(.white.opacity(0.4))
-            }
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 6).fill(claudeOrange.opacity(hovering ? 0.14 : 0)))
+            .contentShape(RoundedRectangle(cornerRadius: 6))
         }
+        .buttonStyle(PressStyle())
+        .onHover { hovering = $0 }
+        .pointerStyle(.link)
+        .animation(.easeOut(duration: 0.14), value: hovering)
+        .accessibilityHint("Opens its terminal")
     }
 }
 
@@ -379,9 +600,14 @@ struct RootView: View {
             VStack(alignment: .leading, spacing: 10) {
                 header
                 if !model.working.isEmpty { sessions }
-                ForEach(model.accounts) { AccountRow(account: $0, working: model.workingCount(account: $0.number)) }
+                ForEach(model.accounts) { a in
+                    AccountRow(account: a, working: model.workingCount(account: a.number),
+                               targets: model.sessions(account: a.number)) { model.open(account: a.number) }
+                }
                 HStack {
-                    if let err = model.error {
+                    if let notice = model.notice {
+                        Text(notice).foregroundStyle(.orange).lineLimit(2)
+                    } else if let err = model.error {
                         Text(err).foregroundStyle(.orange).lineLimit(2)
                     } else if let t = model.updatedAt {
                         Text("updated \(t.formatted(date: .omitted, time: .shortened))")
@@ -428,13 +654,13 @@ struct RootView: View {
     private var sessions: some View {
         let shown = model.working.prefix(Self.maxSessions)
         let rest = model.working.count - shown.count
-        return VStack(alignment: .leading, spacing: 6) {
-            ForEach(shown) { SessionRow(session: $0, account: model.accountOf($0)) }
+        return VStack(alignment: .leading, spacing: 2) {
+            ForEach(shown) { s in SessionRow(session: s, account: model.accountOf(s)) { model.open(s) } }
             if rest > 0 {
-                Text("+\(rest) more").font(.system(size: 10)).foregroundStyle(.white.opacity(0.4))
+                Text("+\(rest) more").font(.system(size: 10)).foregroundStyle(.white.opacity(0.4)).padding(.leading, 6)
             }
         }
-        .padding(10)
+        .padding(4)
         .background(RoundedRectangle(cornerRadius: 10).fill(claudeOrange.opacity(0.08)))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(claudeOrange.opacity(0.22), lineWidth: 1))
         .transition(.opacity.combined(with: .move(edge: .top)))
@@ -475,6 +701,34 @@ struct RootView: View {
 }
 
 // MARK: - Window
+
+// Once the panel takes mouse events the global monitor goes quiet over it, so the view reports
+// moves itself. First mouse: a click on a row works while another app is frontmost.
+final class HostingView: NSHostingView<RootView> {
+    var onMouseMove: (() -> Void)?
+    private var tracker: NSTrackingArea?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracker { removeTrackingArea(tracker) }
+        let t = NSTrackingArea(rect: .zero, options: [.activeAlways, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect],
+                               owner: self, userInfo: nil)
+        addTrackingArea(t)
+        tracker = t
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        onMouseMove?()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        onMouseMove?()
+    }
+}
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = Model()
@@ -520,7 +774,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hasShadow = false
         panel.ignoresMouseEvents = true
         let n = notchSize
-        panel.contentView = NSHostingView(rootView: RootView(model: model, notchWidth: n.width, notchHeight: n.height))
+        let host = HostingView(rootView: RootView(model: model, notchWidth: n.width, notchHeight: n.height))
+        host.onMouseMove = { [weak self] in self?.trackMouse() }
+        panel.contentView = host
         panel.orderFrontRegardless()
     }
 
@@ -548,6 +804,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             collapseWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
         }
+        // Clicks land only on the open shape; everywhere else they fall through to the app below.
+        panel.ignoresMouseEvents = !(inside && model.expanded)
     }
 
     func setExpanded(_ value: Bool) {

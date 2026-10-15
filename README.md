@@ -29,6 +29,25 @@ The expanded state shows a list of the working sessions. For each session, the l
 
 If you turn on Reduce Motion in System Settings, the mark does not turn. A glow around the mark then shows that a session is working.
 
+## Open the terminal of a session
+
+You can click a row in the expanded state to go to the terminal of that session:
+
+- If you click a session in the list of working sessions, the terminal of that session comes to the front.
+- If you click an account card, the terminal of a session of that account comes to the front. The app selects a working session first. If the account has more than one session, each click goes to the next session.
+
+When you move the pointer over an account card, a label shows the name of the terminal app. If the account has more than one open session, the label also shows the count. If the account has no open session, the card shows "no open session" and a click does nothing.
+
+The result is different for each terminal app:
+
+| Terminal app | Result of a click |
+| --- | --- |
+| iTerm2 | The app selects the window, the tab, and the split pane of the session. |
+| Terminal | The app selects the window and the tab of the session. |
+| Other apps, for example Warp or Ghostty | The terminal app comes to the front. These apps do not let other apps select a tab, so you must select the tab yourself. |
+
+For iTerm2 and Terminal, the app uses AppleScript to select the tab. The first time that you click a session in one of these apps, macOS asks if ClaudeNotch can control that app. Click OK. The app has an ad hoc signature, so macOS can ask again after each `./build.sh`.
+
 ## Requirements
 
 You must have these items before you install the app:
@@ -123,6 +142,7 @@ Use this table to find the cause of a problem:
 | The expanded state shows an error line. | Run `~/.local/bin/claude-swap list --json` in Terminal. The app reads the same output, so Terminal shows the same error. |
 | A meter shows `–` in place of a percentage. | claude-swap has no usage data for that limit. Team plans do not report a 7-day limit, so the app does not show that row for them. |
 | The mark does not turn while a session works. | Make sure that the session file of that session is in one of the folders in "How the app gets its data". |
+| A click brings the terminal to the front, but not the correct tab. | Open System Settings > Privacy & Security > Automation. Turn on iTerm2 or Terminal under ClaudeNotch. The footer of the expanded state also shows this message. |
 | The app does not start after `./build.sh`. | Read the status of the launch agent with `launchctl print "gui/$(id -u)/com.irsalsss.claude-notch"`. |
 
 ## License

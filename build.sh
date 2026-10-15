@@ -17,6 +17,7 @@ cat > "$APP/Contents/Info.plist" <<PL
   <key>CFBundleExecutable</key><string>ClaudeNotch</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>ClaudeNotch selects the terminal tab of the session you click.</string>
 </dict></plist>
 PL
 codesign --force --sign - "$APP" >/dev/null
