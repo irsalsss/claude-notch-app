@@ -1,0 +1,598 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ClaudeNotch Showcase</title>
+<!--
+  Product showcase for ClaudeNotch. Every frame is a pure function of time: render.mjs calls
+  window.render(t) for each frame and takes a screenshot, so the video is deterministic.
+  The UI is a recreation of ClaudeNotch.swift (same pt sizes, colors, and layout) with sample data.
+  Session names, folders, tab titles, and window contents are blurred on purpose.
+  Open the file in a browser to preview it in real time.
+-->
+<style>
+  :root {
+    --orange: #D97757;
+    --pt: 1.27;            /* 1512 pt desktop drawn on a 1920 px frame */
+    --sans: -apple-system, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+    --mono: "SF Mono", ui-monospace, Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; background: #0a0a0b; }
+  body { font-family: var(--sans); color: #fff; -webkit-font-smoothing: antialiased; }
+
+  #stage { position: absolute; inset: 0; overflow: hidden; background: #0a0a0b; }
+  #cam { position: absolute; left: 0; top: 0; width: 1512px; height: 851px; transform-origin: 0 0; }
+
+  /* Desktop */
+  #wall {
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(900px 520px at 18% 92%, rgba(201, 112, 74, 0.55), transparent 70%),
+      radial-gradient(760px 480px at 82% 18%, rgba(70, 92, 110, 0.55), transparent 72%),
+      radial-gradient(700px 600px at 60% 70%, rgba(44, 38, 52, 0.9), transparent 70%),
+      linear-gradient(160deg, #15171c 0%, #0f1013 55%, #18110e 100%);
+  }
+  #menubar {
+    position: absolute; left: 0; top: 0; width: 100%; height: 32px; z-index: 10;
+    background: rgba(14, 14, 16, 0.42); backdrop-filter: blur(24px) saturate(140%);
+    display: flex; align-items: center; padding: 0 14px; gap: 18px;
+    font-size: 13px; font-weight: 500; color: rgba(255, 255, 255, 0.92);
+  }
+  #menubar .apple { font-size: 15px; width: 16px; text-align: center; }
+  #menubar .app { font-weight: 700; }
+  #menubar .items { display: flex; gap: 18px; }
+  #menubar .right { margin-left: auto; display: flex; gap: 16px; align-items: center; }
+  .batt { width: 24px; height: 11px; border: 1.2px solid rgba(255,255,255,0.85); border-radius: 3px; padding: 1.4px; position: relative; }
+  .batt::after { content: ""; position: absolute; right: -3.5px; top: 3px; width: 1.6px; height: 3.5px; background: rgba(255,255,255,0.7); border-radius: 0 1px 1px 0; }
+  .batt i { display: block; height: 100%; width: 78%; background: #fff; border-radius: 1px; }
+
+  /* Windows */
+  .win {
+    position: absolute; border-radius: 11px; overflow: hidden;
+    background: #18181b; border: 0.5px solid rgba(255, 255, 255, 0.12);
+    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55), 0 8px 24px rgba(0, 0, 0, 0.4);
+    transform-origin: 50% 50%;
+  }
+  .titlebar { height: 30px; display: flex; align-items: center; padding: 0 12px; gap: 8px; background: #232327; }
+  .lights { display: flex; gap: 8px; }
+  .lights i { width: 12px; height: 12px; border-radius: 50%; display: block; }
+  .lights i:nth-child(1) { background: #ff5f57; }
+  .lights i:nth-child(2) { background: #febc2e; }
+  .lights i:nth-child(3) { background: #28c840; }
+  .win.inactive .lights i { background: #48484c; }
+  .blurtext { filter: blur(4.2px); color: rgba(255, 255, 255, 0.75); user-select: none; }
+
+  #iterm { left: 214px; top: 96px; width: 1010px; height: 640px; }
+  #iterm .tabs { display: flex; height: 32px; background: #1c1c1f; border-bottom: 0.5px solid rgba(255,255,255,0.08); position: relative; }
+  #iterm .tab {
+    flex: 1; display: flex; align-items: center; justify-content: center; gap: 8px;
+    font-size: 12px; color: rgba(255,255,255,0.55); border-right: 0.5px solid rgba(255,255,255,0.07);
+    position: relative;
+  }
+  #iterm .tab .num { font-family: var(--mono); font-size: 10.5px; color: rgba(255,255,255,0.35); filter: none; }
+  #tabActive { position: absolute; top: 0; height: 100%; background: #2c2c31; border-radius: 0; }
+  #tabRing { position: absolute; top: 3px; height: 26px; border-radius: 7px; border: 1.5px solid var(--orange); box-shadow: 0 0 18px rgba(217,119,87,0.45); opacity: 0; }
+  #term { padding: 18px 22px; font-family: var(--mono); font-size: 13px; line-height: 21px; position: relative; height: calc(100% - 62px); }
+  .bar { height: 9px; border-radius: 5px; margin: 6px 0 6px; background: rgba(255,255,255,0.16); }
+  .bar.dim { background: rgba(255,255,255,0.08); }
+  .bar.tint { background: rgba(217,119,87,0.32); }
+  .cc-status { color: var(--orange); font-family: var(--mono); font-size: 13px; margin-top: 14px; display: flex; gap: 8px; align-items: center; }
+  .cc-status .cc-hint { color: rgba(255,255,255,0.4); }
+  .cc-input { margin-top: 12px; border: 1px solid rgba(255,255,255,0.22); border-radius: 8px; padding: 9px 12px; color: rgba(255,255,255,0.5); font-family: var(--mono); font-size: 13px; }
+  .cc-foot { margin-top: 6px; font-size: 11px; color: rgba(255,255,255,0.32); font-family: var(--mono); }
+
+  #editor { left: 486px; top: 168px; width: 820px; height: 560px; background: #1d1e22; }
+  #editor .side { position: absolute; left: 0; top: 30px; bottom: 0; width: 190px; background: #19191d; border-right: 0.5px solid rgba(255,255,255,0.06); padding: 14px; }
+  #editor .code { position: absolute; left: 190px; top: 30px; right: 0; bottom: 0; padding: 18px 22px; }
+
+  /* Notch overlay: the black shape from ClaudeNotch */
+  #shape {
+    position: absolute; top: 0; left: 50%; background: #000; overflow: hidden; z-index: 20;
+    transform: translateX(-50%);
+  }
+  #collapsed { position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 353px; height: 32px; display: flex; font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .wing { width: 84px; display: flex; align-items: center; justify-content: center; gap: 5px; }
+  #count { color: var(--orange); display: inline-block; }
+  .gauges { display: flex; align-items: flex-end; gap: 2.5px; }
+  .gauge { width: 4px; height: 13px; border-radius: 2px; background: rgba(255,255,255,0.15); position: relative; overflow: hidden; }
+  .gauge i { position: absolute; left: 0; bottom: 0; width: 100%; border-radius: 2px; }
+
+  #expanded { position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 380px; padding: 40px 16px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .header { display: flex; align-items: center; gap: 10px; padding-bottom: 2px; }
+  .header .t1 { font-size: 13px; font-weight: 600; }
+  .header .t2 { font-size: 10.5px; font-weight: 500; color: var(--orange); margin-top: 1px; }
+  .sessions { padding: 4px; border-radius: 10px; background: rgba(217,119,87,0.08); box-shadow: inset 0 0 0 1px rgba(217,119,87,0.22); display: flex; flex-direction: column; gap: 2px; }
+  .srow { display: flex; align-items: center; gap: 7px; padding: 3px 6px; border-radius: 6px; font-size: 11px; }
+  .srow .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--orange); flex: none; }
+  .srow .name { font-weight: 600; filter: blur(3.6px); }
+  .srow .folder { font-size: 10.5px; color: rgba(255,255,255,0.45); filter: blur(3.6px); }
+  .srow .acct { margin-left: auto; font-size: 9.5px; font-weight: 500; color: rgba(255,255,255,0.4); font-variant-numeric: tabular-nums; }
+
+  .card { position: relative; padding: 10px; border-radius: 10px; display: flex; flex-direction: column; gap: 5px; transform-origin: 50% 50%; }
+  .card .top { display: flex; align-items: center; gap: 6px; height: 18px; }
+  .badge { width: 18px; height: 18px; border-radius: 5px; display: flex; align-items: center; justify-content: center; font-size: 10.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .label { font-size: 12px; font-weight: 600; }
+  .chip { font-size: 9.5px; font-weight: 600; padding: 1.5px 6px; border-radius: 99px; }
+  .chip.green { color: #34c759; background: rgba(52,199,89,0.15); }
+  .chip.orange { color: var(--orange); background: rgba(217,119,87,0.15); }
+  .hint { margin-left: auto; display: flex; align-items: center; gap: 3px; font-size: 9.5px; font-weight: 600; color: var(--orange); padding: 2px 7px; border-radius: 99px; background: rgba(217,119,87,0.16); box-shadow: inset 0 0 0 0.5px rgba(217,119,87,0.3); }
+  .hint .tglyph { font-family: var(--mono); font-size: 8.5px; font-weight: 700; border: 1px solid currentColor; border-radius: 2.5px; padding: 0 1.5px; line-height: 9px; }
+  .meter { display: flex; align-items: center; gap: 8px; font-size: 10.5px; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .meter .k { width: 22px; color: rgba(255,255,255,0.5); }
+  .meter .track { flex: 1; height: 6px; border-radius: 3px; background: rgba(255,255,255,0.1); position: relative; }
+  .meter .fill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 3px; }
+  .meter .pct { width: 34px; text-align: right; }
+  .meter .cd { width: 50px; text-align: right; color: rgba(255,255,255,0.45); }
+  .footer { font-size: 9.5px; color: rgba(255,255,255,0.4); }
+
+  #cursor { position: absolute; z-index: 30; left: 0; top: 0; width: 22px; height: 30px; transform-origin: 3px 2px; filter: drop-shadow(0 1.5px 2px rgba(0,0,0,0.45)); }
+  #ripple { position: absolute; z-index: 29; width: 36px; height: 36px; margin: -18px 0 0 -18px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.85); opacity: 0; }
+
+  /* Overlays in frame px */
+  #scrim { position: absolute; inset: 0; pointer-events: none;
+    background:
+      linear-gradient(90deg, rgba(6,6,7,0.92) 0%, rgba(6,6,7,0.78) 26%, rgba(6,6,7,0.25) 46%, transparent 58%),
+      linear-gradient(0deg, rgba(6,6,7,0.55) 0%, transparent 45%); }
+  #captions { position: absolute; left: 112px; bottom: 104px; width: 640px; }
+  .cap { position: absolute; left: 0; bottom: 0; width: 640px; opacity: 0; }
+  .cap h2 { font-size: 54px; line-height: 1.08; font-weight: 650; letter-spacing: -0.02em; }
+  .cap p { margin-top: 16px; font-size: 24px; line-height: 1.4; color: rgba(255,255,255,0.62); max-width: 30ch; }
+  .cap h2 em { font-style: normal; color: var(--orange); }
+
+  .card-full { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  #intro { background: #0a0a0b; }
+  #intro .title, #outro .title { font-size: 76px; font-weight: 700; letter-spacing: -0.03em; margin-top: 34px; }
+  #intro .sub { font-size: 26px; color: rgba(255,255,255,0.55); margin-top: 12px; }
+  #outro { background: rgba(8,8,9,0.72); opacity: 0; }
+  #outro .sub { font-size: 28px; color: rgba(255,255,255,0.62); margin-top: 14px; }
+  #outro .url { margin-top: 40px; font-family: var(--mono); font-size: 22px; color: rgba(255,255,255,0.85); padding: 12px 22px; border-radius: 12px; background: rgba(255,255,255,0.06); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12); }
+  #outro .url b { color: var(--orange); font-weight: 600; }
+  #outro .fine { margin-top: 18px; font-size: 17px; color: rgba(255,255,255,0.38); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="cam">
+    <div id="wall"></div>
+
+    <div class="win inactive" id="iterm">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div>
+        <div class="blurtext" style="margin: 0 auto; font-size: 12px; transform: translateX(-26px)">irsal@mac: ~/projects/app</div></div>
+      <div class="tabs" id="tabs">
+        <div id="tabActive"></div>
+        <div class="tab"><span class="blurtext">api-gateway</span><span class="num">⌘1</span></div>
+        <div class="tab"><span class="blurtext">web-client</span><span class="num">⌘2</span></div>
+        <div class="tab"><span class="blurtext">billing-svc</span><span class="num">⌘3</span></div>
+        <div class="tab"><span class="blurtext">notes</span><span class="num">⌘4</span></div>
+        <div id="tabRing"></div>
+      </div>
+      <div id="term"></div>
+    </div>
+
+    <div class="win" id="editor">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div>
+        <div class="blurtext" style="margin: 0 auto; font-size: 12px; transform: translateX(-26px)">checkout-flow.tsx</div></div>
+      <div class="side" id="side"></div>
+      <div class="code" id="code"></div>
+    </div>
+
+    <div id="menubar">
+      <span class="apple">&#xF8FF;</span>
+      <span class="app" id="appname">Code</span>
+      <span class="items" id="menuitems"></span>
+      <span class="right"><span>100%</span><span class="batt"><i></i></span><span>Mon 12 Oct&nbsp;&nbsp;9:41</span></span>
+    </div>
+
+    <div id="shape">
+      <div id="collapsed">
+        <div class="wing"><span id="markS"></span><span id="count"></span></div>
+        <div style="width: 185px"></div>
+        <div class="wing" style="gap: 6px"><span class="gauges" id="gauges"></span><span id="wingPct"></span></div>
+      </div>
+      <div id="expanded">
+        <div class="header"><span id="markH"></span>
+          <div><div class="t1">Claude</div><div class="t2" id="hstatus">Working · 3 sessions</div></div></div>
+        <div class="sessions" id="sessions"></div>
+        <div id="cards" style="display: flex; flex-direction: column; gap: 10px"></div>
+        <div class="footer">updated 9:41 AM</div>
+      </div>
+    </div>
+
+    <div id="ripple"></div>
+    <svg id="cursor" viewBox="0 0 22 30"><path d="M3 2 L3 24 L8.6 18.8 L12.4 27.4 L16 25.8 L12.3 17.4 L19.6 17.2 Z" fill="#000" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg>
+  </div>
+
+  <div id="scrim"></div>
+  <div id="captions">
+    <div class="cap" data-in="4.7" data-out="9.5"><h2>Claude Code,<br>right at the notch.</h2><p>Usage for every claude-swap account, one glance away.</p></div>
+    <div class="cap" data-in="9.9" data-out="12.0"><h2>The mark turns<br>while <em>Claude works</em>.</h2><p>The number counts the busy sessions.</p></div>
+    <div class="cap" data-in="12.6" data-out="17.3"><h2>Hover to see<br>every limit.</h2><p>5-hour and 7-day usage, and when each one resets.</p></div>
+    <div class="cap" data-in="17.6" data-out="21.4"><h2>Click a card.<br>Land in its <em>terminal</em>.</h2><p>Each click steps to the next session of that account.</p></div>
+    <div class="cap" data-in="21.8" data-out="25.9"><h2>iTerm2 opens<br>the exact tab.</h2><p>Window, tab, and split pane. Other terminals come to the front.</p></div>
+  </div>
+
+  <div class="card-full" id="intro">
+    <span id="markI"></span>
+    <div class="title" id="introTitle">ClaudeNotch</div>
+    <div class="sub" id="introSub">Claude Code, at a glance.</div>
+  </div>
+  <div class="card-full" id="outro">
+    <span id="markO"></span>
+    <div class="title">ClaudeNotch</div>
+    <div class="sub">Free and open source, for macOS.</div>
+    <div class="url">github.com/<b>irsalsss/claude-notch-app</b></div>
+    <div class="fine">Works with claude-swap. MIT License.</div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const ORANGE = [217, 119, 87];
+const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, p) => a + (b - a) * p;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+const easeInOut = (p) => p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+const easeOut = (p) => 1 - Math.pow(1 - p, 3);
+const easeOutQuint = (p) => 1 - Math.pow(1 - p, 5);
+// SwiftUI .spring(response: 0.35, dampingFraction: 0.82), as a step response.
+function spring(dt, response = 0.35, zeta = 0.82) {
+  if (dt <= 0) return 0;
+  const w = 2 * Math.PI / response, wd = w * Math.sqrt(1 - zeta * zeta);
+  return 1 - Math.exp(-zeta * w * dt) * (Math.cos(wd * dt) + (zeta * w / wd) * Math.sin(wd * dt));
+}
+function pctColor(p) { return p >= 80 ? [255, 69, 58] : p >= 50 ? [255, 214, 10] : [48, 209, 88]; }
+
+// Deterministic pseudo-random for the placeholder text bars.
+let seed = 7;
+const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+
+// ---- Claude mark, same geometry as ClaudeMark in ClaudeNotch.swift ----
+const RAYS = [1.0, 0.74, 0.93, 0.68, 0.97, 0.79, 0.9, 0.7, 1.0, 0.77, 0.88, 0.72];
+function makeMark(host, size) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "-50 -50 100 100");
+  svg.setAttribute("width", size); svg.setAttribute("height", size);
+  svg.style.display = "block"; svg.style.overflow = "visible";
+  const g = document.createElementNS(ns, "g");
+  svg.appendChild(g);
+  const rects = RAYS.map((_, i) => {
+    const r = document.createElementNS(ns, "rect");
+    r.setAttribute("fill", "#D97757");
+    g.appendChild(r);
+    return r;
+  });
+  host.appendChild(svg);
+  return { svg, g, rects, size };
+}
+// phase drives the breathing (one beat is 1.4 s), wobble 0..1, spin in degrees.
+function drawMark(m, { time = 0, wobble = 0, spin = 0, glow = 0 }) {
+  const radius = 50, w = radius * 0.26;
+  const phase = (time / 1.4) * (Math.PI / 2);
+  m.rects.forEach((r, i) => {
+    const angle = (i / RAYS.length) * 360 - 90;
+    const beat = 0.5 + 0.5 * Math.sin(phase * 4 + i * 1.7);
+    const len = radius * RAYS[i] * (1 - wobble * 0.32 * beat) - w / 2;
+    r.setAttribute("x", -w / 2); r.setAttribute("y", -w / 2);
+    r.setAttribute("width", len + w); r.setAttribute("height", w);
+    r.setAttribute("rx", w / 2);
+    r.setAttribute("transform", `rotate(${angle})`);
+  });
+  m.g.setAttribute("transform", `rotate(${spin})`);
+  m.svg.style.filter = glow > 0 ? `drop-shadow(0 0 ${m.size * 0.3}px ${rgba(ORANGE, 0.75 * glow)})` : "none";
+}
+
+// ---- Sample data (labels are aliases; session names and folders are blurred) ----
+const ACCOUNTS = [
+  { n: 1, label: "personal", active: true, working: 2, h5: [8, "52m"], d7: [58, "2d 20h"] },
+  { n: 2, label: "work", working: 1, h5: [53, "2h 12m"] },
+  { n: 3, label: "research", working: 0, h5: [9, "2h 12m"] },
+  { n: 4, label: "team", working: 0, h5: [20, "2h 12m"] },
+];
+const SESSIONS = [
+  { name: "api-gateway", folder: "platform", acct: 1 },
+  { name: "web-client", folder: "frontend", acct: 1 },
+  { name: "billing-svc", folder: "payments", acct: 2 },
+];
+
+// ---- Build static DOM ----
+const marks = {
+  S: makeMark($("markS"), 16), H: makeMark($("markH"), 22),
+  I: makeMark($("markI"), 150), O: makeMark($("markO"), 110),
+};
+$("gauges").innerHTML = ACCOUNTS.map(() => `<span class="gauge"><i></i></span>`).join("");
+$("sessions").innerHTML = SESSIONS.map((s) =>
+  `<div class="srow"><span class="dot"></span><span class="name">${s.name}</span><span class="folder">${s.folder}</span><span class="acct">#${s.acct}</span></div>`).join("");
+function meter(k, [p, cd]) {
+  return `<div class="meter"><span class="k">${k}</span><span class="track"><span class="fill" data-p="${p}"></span></span><span class="pct">${p}%</span><span class="cd">${cd}</span></div>`;
+}
+$("cards").innerHTML = ACCOUNTS.map((a) => `
+  <div class="card" data-n="${a.n}">
+    <div class="top">
+      <span class="badge">${a.n}</span><span class="label">${a.label}</span>
+      ${a.active ? `<span class="chip green">default</span>` : ""}
+      ${a.working ? `<span class="chip orange">${a.working} working</span>` : ""}
+      ${a.n === 2 ? `<span class="hint"><span class="tglyph">&gt;_</span>iTerm2<span>&#x2197;</span></span>` : ""}
+    </div>
+    ${meter("5h", a.h5)}${a.d7 ? meter("7d", a.d7) : ""}
+  </div>`).join("");
+
+function bars(host, rows, palette) {
+  host.innerHTML = rows.map(([indent, width, cls]) =>
+    `<div class="bar ${cls || ""}" style="margin-left:${indent}px;width:${width}px;${palette ? `background:${palette}` : ""}"></div>`).join("");
+}
+// Terminal: blurred output above a Claude Code status line and prompt.
+seed = 11;
+const termRows = [];
+for (let i = 0; i < 14; i++) termRows.push([i % 5 === 0 ? 0 : 22, 160 + rnd() * 560, i % 5 === 0 ? "tint" : i % 3 === 0 ? "dim" : ""]);
+$("term").innerHTML = `<div id="termbars"></div>
+  <div class="cc-status"><span id="ccStar">✻</span><span>Refactoring…</span><span class="cc-hint">(48s · esc to interrupt)</span></div>
+  <div class="cc-input">&gt; <span class="blurtext" style="color: rgba(255,255,255,0.55)">add retries to the webhook handler</span></div>
+  <div class="cc-foot">? for shortcuts</div>`;
+bars($("termbars"), termRows);
+seed = 23;
+const codeRows = [];
+for (let i = 0; i < 26; i++) codeRows.push([((i * 7) % 4) * 18, 120 + rnd() * 380, i % 6 === 0 ? "dim" : ""]);
+bars($("code"), codeRows);
+const sideRows = [];
+for (let i = 0; i < 14; i++) sideRows.push([i % 4 === 0 ? 0 : 14, 60 + rnd() * 80, "dim"]);
+bars($("side"), sideRows);
+
+const MENUS = {
+  Code: ["File", "Edit", "Selection", "View", "Go", "Run", "Window", "Help"],
+  iTerm2: ["Shell", "Edit", "View", "Session", "Scripts", "Profiles", "Window", "Help"],
+};
+function setApp(name) {
+  if ($("appname").textContent === name) return;
+  $("appname").textContent = name;
+  $("menuitems").innerHTML = MENUS[name].map((m) => `<span>${m}</span>`).join("");
+}
+setApp("iTerm2"); setApp("Code");
+
+const cards = [...document.querySelectorAll(".card")];
+const caps = [...document.querySelectorAll(".cap")];
+
+// An element's box in desktop pt, undoing the camera transform of this frame.
+let camT = { tx: 0, ty: 0, k: 1 };
+function boxInCam(el) {
+  const r = el.getBoundingClientRect();
+  return { x: (r.left - camT.tx) / camT.k, y: (r.top - camT.ty) / camT.k, w: r.width / camT.k, h: r.height / camT.k };
+}
+
+// ---- Timeline (seconds) ----
+const T = {
+  introOut: 3.0, desk: 3.4,
+  zoomIn: [4.2, 6.0],
+  work: [10.0, 10.7, 11.3],
+  cursorIn: 11.4, enter: 12.4,
+  toCard: [16.6, 17.6], click: 19.4,
+  zoomOut: [19.7, 21.0], front: 19.9, tabSwap: 20.4,
+  leave: [21.2, 21.9], collapse: 21.95,
+  tabZoom: [22.4, 23.8], tabZoomOut: [25.0, 26.2],
+  outro: 26.0, end: 31.0,
+};
+
+// Camera keyframes: zoom s (on top of the 1.27 pt scale), focus point in pt, anchor in frame px.
+const CAM = [
+  { t: 3.2, s: 1.0, fx: 756, fy: 425, ax: 960, ay: 540 },
+  { t: 4.2, s: 1.04, fx: 756, fy: 425, ax: 960, ay: 540 },
+  { t: 6.0, s: 2.7, fx: 756, fy: 0, ax: 1180, ay: 0 },
+  { t: 11.6, s: 2.7, fx: 756, fy: 0, ax: 1180, ay: 0 },
+  { t: 12.6, s: 1.42, fx: 756, fy: 0, ax: 1230, ay: 0 },
+  { t: 19.7, s: 1.42, fx: 756, fy: 0, ax: 1230, ay: 0 },
+  { t: 21.0, s: 1.0, fx: 756, fy: 425, ax: 1010, ay: 540 },
+  { t: 22.4, s: 1.0, fx: 756, fy: 425, ax: 1010, ay: 540 },
+  { t: 23.8, s: 1.75, fx: 719, fy: 142, ax: 1150, ay: 300 },
+  { t: 25.0, s: 1.75, fx: 719, fy: 142, ax: 1150, ay: 300 },
+  { t: 26.6, s: 1.06, fx: 756, fy: 425, ax: 960, ay: 540 },
+  { t: 31.0, s: 1.1, fx: 756, fy: 425, ax: 960, ay: 540 },
+];
+function camAt(t) {
+  if (t <= CAM[0].t) return CAM[0];
+  for (let i = 0; i < CAM.length - 1; i++) {
+    const a = CAM[i], b = CAM[i + 1];
+    if (t <= b.t) {
+      const p = easeInOut(seg(t, a.t, b.t));
+      const o = {};
+      for (const k of ["s", "fx", "fy", "ax", "ay"]) o[k] = lerp(a[k], b[k], p);
+      return o;
+    }
+  }
+  return CAM[CAM.length - 1];
+}
+
+// Cursor keyframes in pt.
+function cursorAt(t, card2) {
+  const keys = [
+    { t: T.cursorIn, x: 900, y: 330 },
+    { t: T.enter - 0.1, x: 760, y: 18 },
+    { t: 13.2, x: 812, y: 62 },
+    { t: T.toCard[0], x: 812, y: 62 },
+    { t: T.toCard[1], x: card2.x, y: card2.y },
+    { t: T.leave[0], x: card2.x, y: card2.y },
+    { t: T.leave[1], x: 640, y: 560 },
+    { t: 40, x: 640, y: 560 },
+  ];
+  for (let i = 0; i < keys.length - 1; i++) {
+    const a = keys[i], b = keys[i + 1];
+    if (t <= b.t) {
+      const p = easeInOut(seg(t, a.t, b.t));
+      // A slight arc reads as a hand, a straight line reads as a robot.
+      const arc = Math.sin(p * Math.PI) * Math.hypot(b.x - a.x, b.y - a.y) * 0.08;
+      return { x: lerp(a.x, b.x, p) + arc, y: lerp(a.y, b.y, p) - arc * 0.4 };
+    }
+  }
+  return keys[keys.length - 1];
+}
+
+function render(t) {
+  // Intro card
+  const introP = seg(t, T.introOut, T.introOut + 0.8);
+  $("intro").style.opacity = 1 - easeInOut(introP);
+  $("intro").style.display = introP >= 1 ? "none" : "flex";
+  const ti = seg(t, 0.35, 1.25), ts = seg(t, 0.6, 1.4);
+  $("introTitle").style.opacity = easeOut(ti);
+  $("introTitle").style.transform = `translateY(${(1 - easeOut(ti)) * 18}px)`;
+  $("introSub").style.opacity = easeOut(ts);
+  $("introSub").style.transform = `translateY(${(1 - easeOut(ts)) * 14}px)`;
+  const mi = spring(t - 0.05, 0.6, 0.7);
+  marks.I.svg.style.transform = `scale(${lerp(0.4, 1, mi)})`;
+  marks.I.svg.style.opacity = clamp(mi * 1.4);
+  drawMark(marks.I, { time: t, wobble: clamp(t / 0.6), spin: t * 45, glow: 1 });
+
+  // Camera
+  const c = camAt(t);
+  const k = 1.27 * c.s;
+  camT = { tx: c.ax - c.fx * k, ty: c.ay - c.fy * k, k };
+  $("cam").style.transform = `translate(${camT.tx}px, ${camT.ty}px) scale(${k})`;
+
+  // Working state of the sessions
+  const busy = t < T.work[0] ? 0 : t < T.work[1] ? 1 : t < T.work[2] ? 2 : 3;
+  const workStart = T.work[0];
+  const wob = clamp((t - workStart) / 0.3);
+  const markState = busy > 0
+    ? { time: t - workStart, wobble: wob, spin: (t - workStart) * 45, glow: wob }
+    : { time: 0, wobble: 0, spin: 0, glow: 0 };
+  drawMark(marks.S, markState);
+  drawMark(marks.H, { time: t, wobble: 1, spin: t * 45, glow: 1 });
+  $("count").textContent = busy ? String(busy) : "";
+  const lastChange = [...T.work].reverse().find((x) => t >= x);
+  const pop = lastChange ? spring(t - lastChange, 0.3, 0.55) : 0;
+  $("count").style.transform = `scale(${lerp(0.4, 1, pop)})`;
+  $("count").style.opacity = clamp(pop * 1.5);
+
+  // Collapsed gauges
+  [...document.querySelectorAll(".gauge i")].forEach((g, i) => {
+    const a = ACCOUNTS[i];
+    g.style.height = `${Math.max(2, 13 * a.h5[0] / 100)}px`;
+    g.style.background = rgba(pctColor(a.h5[0]), 1);
+    g.parentElement.style.opacity = a.active ? 1 : 0.45;
+  });
+  $("wingPct").textContent = "8%";
+  $("wingPct").style.color = rgba(pctColor(8), 1);
+
+  // Expand and collapse: the same spring as the app
+  const pOpen = spring(t - T.enter);
+  const pClose = spring(t - T.collapse);
+  const p = t < T.collapse ? pOpen : 1 - pClose;
+  const H = $("expanded").offsetHeight;
+  const shape = $("shape");
+  shape.style.width = `${lerp(353, 380, p)}px`;
+  shape.style.height = `${lerp(32, H, p)}px`;
+  const r = lerp(9, 22, clamp(p, 0, 1.2));
+  shape.style.borderRadius = `0 0 ${r}px ${r}px`;
+  $("collapsed").style.opacity = 1 - clamp(p * 2.2);
+  $("expanded").style.opacity = clamp((p - 0.25) / 0.6);
+
+  // Meters fill in, one card after another
+  cards.forEach((card, i) => {
+    card.querySelectorAll(".fill").forEach((f, j) => {
+      const pct = +f.dataset.p;
+      const fp = easeOutQuint(seg(t, T.enter + 0.15 + i * 0.07 + j * 0.05, T.enter + 1.0 + i * 0.07 + j * 0.05));
+      const col = pctColor(pct);
+      f.style.width = `max(4px, ${pct * fp}%)`;
+      f.style.background = `linear-gradient(90deg, ${rgba(col, 0.55)}, ${rgba(col, 1)})`;
+      f.style.boxShadow = `0 0 3px ${rgba(col, 0.5)}`;
+    });
+  });
+
+  // Hover and press on card 2
+  const card2 = cards[1];
+  const cb = boxInCam(card2);
+  const target = { x: cb.x + cb.w * 0.56, y: cb.y + cb.h * 0.52 };
+  const hoverIn = easeOut(seg(t, T.toCard[1] - 0.12, T.toCard[1] + 0.05));
+  const hoverOut = easeOut(seg(t, T.leave[0] + 0.15, T.leave[0] + 0.3));
+  const h = clamp(hoverIn - hoverOut);
+  const press = t >= T.click && t < T.click + 0.3
+    ? Math.sin(seg(t, T.click, T.click + 0.3) * Math.PI) : 0;
+  cards.forEach((card, i) => {
+    const a = ACCOUNTS[i];
+    const hh = i === 1 ? h : 0;
+    const base = a.active ? 0.07 : 0.03;
+    card.style.background = `rgba(255,255,255,${base + 0.06 * hh})`;
+    card.style.boxShadow = `inset 0 0 0 1px ${rgba(ORANGE, 0.45 * hh)}, 0 0 10px ${rgba(ORANGE, 0.22 * hh)}`;
+    card.style.transform = `scale(${(1 + 0.012 * hh) * (1 - (i === 1 ? 0.025 * press : 0))})`;
+    card.style.filter = i === 1 && press ? `brightness(${1 + 0.12 * press})` : "none";
+    const badge = card.querySelector(".badge");
+    badge.style.background = hh > 0.5 ? rgba(ORANGE, 1) : `rgba(255,255,255,${0.1})`;
+    badge.style.color = hh > 0.5 ? "#000" : "rgba(255,255,255,0.75)";
+    const hint = card.querySelector(".hint");
+    if (hint) { hint.style.opacity = hh; hint.style.transform = `translateX(${(1 - hh) * 6}px)`; }
+  });
+
+  // Cursor
+  const cur = cursorAt(t, target);
+  const cursor = $("cursor");
+  cursor.style.opacity = easeOut(seg(t, T.cursorIn - 0.2, T.cursorIn + 0.2));
+  cursor.style.transform = `translate(${cur.x - 3}px, ${cur.y - 2}px) scale(${0.62 * (1 - 0.12 * press)})`;
+  const rp = seg(t, T.click + 0.05, T.click + 0.6);
+  $("ripple").style.opacity = rp > 0 && rp < 1 ? 0.8 * (1 - rp) : 0;
+  $("ripple").style.left = `${target.x}px`;
+  $("ripple").style.top = `${target.y}px`;
+  $("ripple").style.transform = `scale(${lerp(0.3, 1.3, easeOut(rp))})`;
+
+  // iTerm2 comes to the front and selects tab 3
+  const front = easeOut(seg(t, T.front, T.front + 0.45));
+  const iterm = $("iterm"), editor = $("editor");
+  const inFront = t >= T.front + 0.08;
+  iterm.style.zIndex = inFront ? 3 : 1;
+  editor.style.zIndex = inFront ? 1 : 2;
+  iterm.classList.toggle("inactive", !inFront);
+  editor.classList.toggle("inactive", inFront);
+  iterm.style.transform = inFront ? `scale(${1 + 0.012 * Math.sin(front * Math.PI)})` : "none";
+  editor.style.filter = `brightness(${1 - 0.18 * front})`;
+  iterm.style.filter = `brightness(${0.82 + 0.18 * front})`;
+  setApp(inFront ? "iTerm2" : "Code");
+  const tabs = [...document.querySelectorAll("#iterm .tab")];
+  const swap = easeInOut(seg(t, T.tabSwap, T.tabSwap + 0.35));
+  const from = tabs[0], to = tabs[2];
+  const left = lerp(from.offsetLeft, to.offsetLeft, swap);
+  $("tabActive").style.left = `${left}px`;
+  $("tabActive").style.width = `${to.offsetWidth}px`;
+  tabs.forEach((tb, i) => { tb.style.color = (swap > 0.5 ? i === 2 : i === 0) ? "rgba(255,255,255,0.92)" : "rgba(255,255,255,0.5)"; });
+  const ring = easeOut(seg(t, T.tabZoom[0] + 0.4, T.tabZoom[1])) * (1 - easeOut(seg(t, T.tabZoomOut[0], T.tabZoomOut[0] + 0.4)));
+  $("tabRing").style.left = `${to.offsetLeft + 4}px`;
+  $("tabRing").style.width = `${to.offsetWidth - 8}px`;
+  $("tabRing").style.opacity = ring;
+  $("ccStar").style.display = "inline-block";
+  $("ccStar").style.transform = `rotate(${t * 120}deg)`;
+
+  // Captions
+  caps.forEach((cap) => {
+    const a = +cap.dataset.in, b = +cap.dataset.out;
+    const pin = easeOut(seg(t, a, a + 0.6)), pout = easeInOut(seg(t, b - 0.4, b));
+    const sub = easeOut(seg(t, a + 0.14, a + 0.74));
+    cap.style.opacity = pin * (1 - pout);
+    cap.querySelector("h2").style.transform = `translateY(${(1 - pin) * 24 - pout * 10}px)`;
+    cap.querySelector("p").style.opacity = sub;
+    cap.querySelector("p").style.transform = `translateY(${(1 - sub) * 18}px)`;
+  });
+  $("scrim").style.opacity = easeOut(seg(t, 4.4, 5.0)) * (1 - easeOut(seg(t, T.outro, T.outro + 0.6)));
+
+  // Outro
+  const po = easeInOut(seg(t, T.outro, T.outro + 0.9));
+  $("outro").style.opacity = po;
+  $("stage").querySelector("#cam").style.filter = po > 0 ? `blur(${po * 14}px)` : "none";
+  [...$("outro").children].forEach((el, i) => {
+    const pe = easeOut(seg(t, T.outro + 0.3 + i * 0.12, T.outro + 1.1 + i * 0.12));
+    el.style.opacity = pe;
+    el.style.transform = `translateY(${(1 - pe) * 20}px)`;
+  });
+  drawMark(marks.O, { time: t, wobble: 1, spin: t * 45, glow: 1 });
+}
+window.render = render;
+window.DURATION = T.end;
+
+// Live preview when opened directly in a browser.
+if (!navigator.webdriver) {
+  const t0 = performance.now();
+  const loop = () => { render(((performance.now() - t0) / 1000) % T.end); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+} else {
+  render(0);
+}
+</script>
+</body>
+</html>

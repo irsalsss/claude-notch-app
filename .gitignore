@@ -17,3 +17,6 @@ build/
 *.mobileprovision
 credentials*.json
 .credentials.json
+
+# Showcase renders (stills and the MP4)
+showcase/out/
