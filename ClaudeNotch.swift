@@ -4,10 +4,12 @@
 //   activity Claude Code's own `sessions/<pid>.json` files, which carry `status: busy | idle | waiting`,
 //            read from ~/.claude/sessions and every ~/.claude-swap-backup/sessions/<N-email>/sessions.
 import AppKit
+import IOKit.pwr_mgt
 import SwiftUI
 
 let claudeOrange = Color(red: 0.851, green: 0.467, blue: 0.341)  // #D97757
 let askBlue = Color(red: 0.353, green: 0.659, blue: 1.0)  // #5AA8FF: a session waits for your answer
+let lemburPurple = Color(red: 0.722, green: 0.592, blue: 1.0)  // #B897FF: mode lembur holds the Mac awake
 
 // MARK: - Data
 
@@ -60,6 +62,13 @@ struct Payload: Decodable {
     let accounts: [Account]
 }
 
+// What a session file's status cannot see: a background subagent writes its own transcript while
+// the session reads `idle`, and a background Bash task is a shell the session still owns.
+struct Activity {
+    var lastWrite: Date?  // newest write to any transcript, subagents included
+    var shells = 0  // Bash tool shells still running under a live session
+}
+
 final class Model: ObservableObject {
     static let cli = NSHomeDirectory() + "/.local/bin/claude-swap"
 
@@ -71,9 +80,22 @@ final class Model: ObservableObject {
     @Published var sessions: [Session] = []
     @Published var notice: String?
 
+    // Mode lembur: one-shot. It holds the Mac awake until every agent on this Mac stops, then sleeps it.
+    @Published var lembur = false
+    @Published var sleepAt: Date?  // when the current quiet streak ends in sleep; nil while anything runs
+
     private var loading = false
     private var cycle: [Int: Int] = [:]
     private var noticeWork: DispatchWorkItem?
+    private var assertion = IOPMAssertionID(0)
+    private var activity = Activity()
+    private var scannedAt = Date.distantPast
+    private var scanning = false
+    private var quietSince: Date?
+
+    static let quietFor: TimeInterval = 120  // every session idle this long before the sleep
+    static let transcriptQuiet: TimeInterval = 180  // no transcript write for this long
+    static let scanEvery: TimeInterval = 10
 
     var active: Account? { accounts.first(where: \.active) }
     var working: [Session] { sessions.filter(\.working) }
@@ -103,6 +125,10 @@ final class Model: ObservableObject {
 
     func open(_ s: Session) {
         guard let problem = TerminalFocus.focus(pid: s.pid) else { return }
+        show(problem)
+    }
+
+    private func show(_ problem: String) {
         noticeWork?.cancel()
         notice = problem
         let work = DispatchWorkItem { [weak self] in self?.notice = nil }
@@ -115,8 +141,109 @@ final class Model: ObservableObject {
             let found = Self.scanSessions()
             DispatchQueue.main.async {
                 if found != self.sessions { self.sessions = found }
+                self.checkLembur()
             }
         }
+    }
+
+    func toggleLembur() {
+        if lembur { endLembur(); return }
+        let made = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+                                               IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                               "ClaudeNotch mode lembur: agents are still running" as CFString, &assertion)
+        guard made == kIOReturnSuccess else { show("Could not hold the Mac awake (IOKit \(made))"); return }
+        lembur = true
+        quietSince = nil
+        scannedAt = .distantPast
+        checkLembur()
+    }
+
+    private func endLembur() {
+        if lembur { IOPMAssertionRelease(assertion) }
+        lembur = false
+        sleepAt = nil
+        quietSince = nil
+    }
+
+    // Runs every second. The Mac sleeps only when no session works, no Bash shell runs, no transcript
+    // was written for `transcriptQuiet`, all of that held for `quietFor`, and a scan made after the
+    // deadline still agrees. Any activity restarts the streak.
+    private func checkLembur() {
+        guard lembur else { return }
+        let now = Date()
+        let due = sleepAt.map { now >= $0 } ?? false
+        if !scanning, now.timeIntervalSince(scannedAt) >= Self.scanEvery || (due && scannedAt < sleepAt!) {
+            scanning = true
+            let pids = Set(sessions.map(\.pid))
+            DispatchQueue.global(qos: .utility).async {
+                let found = Self.scanActivity(sessionPids: pids)
+                DispatchQueue.main.async {
+                    self.activity = found
+                    self.scannedAt = Date()
+                    self.scanning = false
+                    self.checkLembur()
+                }
+            }
+        }
+        guard scannedAt != .distantPast else { return }
+        let wrote = activity.lastWrite.map { now.timeIntervalSince($0) < Self.transcriptQuiet } ?? false
+        if !working.isEmpty || activity.shells > 0 || wrote {
+            quietSince = nil
+            if sleepAt != nil { sleepAt = nil }
+            return
+        }
+        let since = quietSince ?? now
+        quietSince = since
+        let at = since + Self.quietFor
+        if sleepAt != at { sleepAt = at }
+        if now >= at, scannedAt >= at { sleepNow() }
+    }
+
+    private func sleepNow() {
+        endLembur()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        proc.arguments = ["sleepnow"]
+        do { try proc.run() } catch { show("pmset sleepnow failed: \(error.localizedDescription)") }
+    }
+
+    private static func scanActivity(sessionPids: Set<Int32>) -> Activity {
+        let fm = FileManager.default
+        let home = NSHomeDirectory()
+        var roots = [home + "/.claude/projects"]
+        let swap = home + "/.claude-swap-backup/sessions"
+        for d in (try? fm.contentsOfDirectory(atPath: swap)) ?? [] { roots.append(swap + "/" + d + "/projects") }
+        var newest: Date?
+        for root in roots {
+            guard let walk = fm.enumerator(at: URL(fileURLWithPath: root),
+                                           includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            for case let url as URL in walk where url.pathExtension == "jsonl" {
+                guard let d = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+                else { continue }
+                if d > newest ?? .distantPast { newest = d }
+            }
+        }
+        return Activity(lastWrite: newest, shells: shellCount(under: sessionPids))
+    }
+
+    // The Bash tool runs each command as a child `/bin/zsh -c source …/shell-snapshots/…` of its
+    // session. MCP servers and Claude Code's own `caffeinate` are children too, so they do not count.
+    private static func shellCount(under pids: Set<Int32>) -> Int {
+        guard !pids.isEmpty else { return 0 }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-axo", "ppid=,command="]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = FileHandle.nullDevice
+        guard (try? proc.run()) != nil else { return 0 }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        return String(decoding: data, as: UTF8.self).split(separator: "\n").filter { line in
+            let parts = line.split(separator: " ", maxSplits: 1)
+            guard parts.count == 2, let ppid = Int32(parts[0]) else { return false }
+            return pids.contains(ppid) && parts[1].contains("/shell-snapshots/")
+        }.count
     }
 
     private static func scanSessions() -> [Session] {
@@ -533,6 +660,43 @@ struct OpenHint: View {
     }
 }
 
+// Header toggle for mode lembur. Off: "Lembur". On: lit, and a countdown once everything is quiet.
+struct LemburToggle: View {
+    let on: Bool
+    let sleepAt: Date?
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: on ? "moon.zzz.fill" : "moon.zzz")
+                if on, let sleepAt {
+                    let now = Date()
+                    Text("Sleep")
+                    Text(timerInterval: now...max(sleepAt, now), countsDown: true).monospacedDigit()
+                } else {
+                    Text("Lembur")
+                }
+            }
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(on ? .black : .white.opacity(hovering ? 0.9 : 0.6))
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(Capsule().fill(on ? lemburPurple : .white.opacity(hovering ? 0.14 : 0.08)))
+            .shadow(color: on ? lemburPurple.opacity(0.5) : .clear, radius: 6)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(PressStyle())
+        .onHover { hovering = $0 }
+        .pointerStyle(.link)
+        .animation(.easeOut(duration: 0.14), value: hovering)
+        .help(on ? "Mode lembur is on. Click to cancel. The Mac stays awake, then sleeps once every agent stops."
+                 : "Keep the Mac awake until every Claude agent on this Mac stops, then sleep it.")
+        .accessibilityLabel(on ? "Mode lembur on" : "Mode lembur off")
+        .accessibilityHint(on ? "Cancels mode lembur" : "Keeps the Mac awake until every agent stops, then sleeps it")
+    }
+}
+
 struct AccountRow: View {
     let account: Account
     let working: Int
@@ -668,6 +832,7 @@ struct RootView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.working)
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.needsYou)
+            .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.lembur)
     }
 
     @ViewBuilder private var content: some View {
@@ -686,6 +851,10 @@ struct RootView: View {
                         Text(notice).foregroundStyle(.orange).lineLimit(2)
                     } else if let err = model.error {
                         Text(err).foregroundStyle(.orange).lineLimit(2)
+                    } else if model.lembur {
+                        Text(model.sleepAt == nil ? "Lembur: waiting for every agent to stop"
+                                                  : "Lembur: all quiet. Any activity restarts the countdown")
+                            .foregroundStyle(lemburPurple.opacity(0.8))
                     } else if let t = model.updatedAt {
                         Text("updated \(t.formatted(date: .omitted, time: .shortened))")
                     }
@@ -734,6 +903,7 @@ struct RootView: View {
                 .contentTransition(.opacity)
             }
             Spacer()
+            LemburToggle(on: model.lembur, sleepAt: model.sleepAt) { model.toggleLembur() }
         }
         .padding(.bottom, 2)
     }
@@ -771,6 +941,13 @@ struct RootView: View {
                 .transition(.opacity.combined(with: .scale))
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("\(w) session\(w == 1 ? "" : "s") waiting for you")
+            }
+            if model.lembur {
+                Image(systemName: "moon.zzz.fill")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(lemburPurple)
+                    .transition(.opacity.combined(with: .scale))
+                    .accessibilityLabel("Mode lembur on")
             }
         }
         .frame(width: Self.wing)

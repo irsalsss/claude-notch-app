@@ -49,6 +49,26 @@ The result is different for each terminal app:
 
 For iTerm2 and Terminal, the app uses AppleScript to select the tab. The first time that you click a session in one of these apps, macOS asks if ClaudeNotch can control that app. Click OK. The app has an ad hoc signature, so macOS can ask again after each `./build.sh`.
 
+## Mode lembur
+
+Mode lembur keeps the Mac awake until every Claude Code agent on this Mac stops. Then it puts the Mac to sleep. Use it when you leave long work running and do not want the Mac to stay on all night.
+
+To turn on mode lembur, open the expanded state and click `Lembur` in the header. The button turns purple, and a moon shows next to the Claude mark in the collapsed state. To cancel, click the button again.
+
+While the mode is on, the app holds a macOS power assertion (a request to the system that blocks idle sleep). The display can still turn off and lock. A locked screen does not stop the work. Only system sleep stops it.
+
+The app puts the Mac to sleep only when all of these conditions are true:
+
+- No session reads `busy`. A session that waits for your answer does not count as running, because it cannot continue without you.
+- No Bash tool shell runs under a live session. This includes a background task that the session started.
+- No transcript in `~/.claude/projects` or `~/.claude-swap-backup/sessions/*/projects` changed in the last 3 minutes. This catches a background subagent, which writes its own transcript while its session reads `idle`.
+
+These conditions must stay true for 2 minutes. The header button then shows a countdown. If any activity starts during the countdown, the countdown stops and starts again later. When the countdown ends, the app makes a new scan. If the new scan agrees, the app releases the assertion and runs `pmset sleepnow`.
+
+The mode is one-shot. After the sleep, the mode is off. If the app restarts, the mode is also off.
+
+The checks cover the whole Mac, not one tab, because a sleep stops the work in every tab. A session can still get a new prompt one second after the sleep starts. The app cannot prevent this case.
+
 ## Requirements
 
 You must have these items before you install the app:
@@ -130,7 +150,7 @@ A session file can stay on the disk after its process stops, for example after a
 
 ## Privacy
 
-The app does not send data over the network. Only claude-swap makes network requests, to get the usage data. The app does not write files and does not keep a history.
+The app does not send data over the network. Only claude-swap makes network requests, to get the usage data. The app does not write files and does not keep a history. In mode lembur, the app reads only the modification time of each transcript, not its content.
 
 If your account names are private, do not share screenshots of the expanded state. Each account card shows the first part of the account email, or the alias that you set in claude-swap.
 
