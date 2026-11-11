@@ -3,6 +3,7 @@
 //   usage    `claude-swap list --json` (uses claude-swap's own usage cache and polling)
 //   activity Claude Code's own `sessions/<pid>.json` files, which carry `status: busy | idle | waiting`,
 //            read from ~/.claude/sessions and every ~/.claude-swap-backup/sessions/<N-email>/sessions.
+// The one file the app writes is the notes: ~/Library/Application Support/ClaudeNotch/notes.md.
 import AppKit
 import IOKit.pwr_mgt
 import SwiftUI
@@ -20,10 +21,12 @@ struct Session: Identifiable, Equatable {
     let status: String
     let waitingFor: String?
     let account: Int?  // nil: a plain `claude` on ~/.claude, which runs as claude-swap's default account
+    var shellBusy = true  // `shell`: a background Bash shell does work; false when only a service rests
     var id: Int32 { pid }
     // `waiting` with "dialog open" is a dialog you opened yourself (a slash command), not Claude asking.
     var needsYou: Bool { status == "waiting" && waitingFor != "dialog open" }
-    var working: Bool { status != "idle" && status != "waiting" }
+    // `shell` is an idle session that still owns a background shell. A resting `pnpm dev` is not work.
+    var working: Bool { status == "shell" ? shellBusy : status != "idle" && status != "waiting" }
     // Claude Code's own grouping: "input needed" is a question, every other wait is a permission.
     var ask: String { waitingFor == "input needed" ? "question" : "permission" }
     var folder: String { (cwd as NSString).lastPathComponent }
@@ -66,7 +69,7 @@ struct Payload: Decodable {
 // the session reads `idle`, and a background Bash task is a shell the session still owns.
 struct Activity {
     var lastWrite: Date?  // newest write to any transcript, subagents included
-    var shells = 0  // Bash tool shells still running under a live session
+    var shells = 0  // busy Bash tool shells under a live session (see `busyShells`)
 }
 
 final class Model: ObservableObject {
@@ -79,6 +82,7 @@ final class Model: ObservableObject {
     @Published var contentSize: CGSize = .zero
     @Published var sessions: [Session] = []
     @Published var notice: String?
+    @Published var notesOpen = false
 
     // Mode lembur: one-shot. It holds the Mac awake until every agent on this Mac stops, then sleeps it.
     @Published var lembur = false
@@ -92,10 +96,16 @@ final class Model: ObservableObject {
     private var scannedAt = Date.distantPast
     private var scanning = false
     private var quietSince: Date?
+    private var shellsAt = Date.distantPast
+    private var busy: [Int32: Int] = [:]  // busy shells per `shell` session, from the last shell scan
 
     static let quietFor: TimeInterval = 120  // every session idle this long before the sleep
     static let transcriptQuiet: TimeInterval = 180  // no transcript write for this long
     static let scanEvery: TimeInterval = 10
+    static let shellEvery: TimeInterval = 5
+    static let restingCPU = 5.0  // %CPU of a whole shell tree under which a service counts as resting
+    // A service never ends by itself: a dev server or a watcher. Matched on the shell's child processes.
+    static let servicePattern = #"(^|\s)(dev|serve|preview)(\s|$)|--watch|(^|\s)-w(\s|$)|tail -f|nodemon"#
 
     var active: Account? { accounts.first(where: \.active) }
     var working: [Session] { sessions.filter(\.working) }
@@ -137,9 +147,19 @@ final class Model: ObservableObject {
     }
 
     func refreshSessions() {
+        let rescan = Date().timeIntervalSince(shellsAt) >= Self.shellEvery
+        if rescan { shellsAt = Date() }
         DispatchQueue.global(qos: .utility).async {
-            let found = Self.scanSessions()
+            let scanned = Self.scanSessions()
+            let shelled = Set(scanned.filter { $0.status == "shell" }.map(\.pid))
+            let busy = rescan ? Self.busyShells(under: shelled) : nil
             DispatchQueue.main.async {
+                var found = scanned
+                if let busy { self.busy = busy }
+                // Before the first shell scan of a session, its shell counts as busy.
+                for i in found.indices where found[i].status == "shell" {
+                    found[i].shellBusy = self.busy[found[i].pid].map { $0 > 0 } ?? true
+                }
                 if found != self.sessions { self.sessions = found }
                 self.checkLembur()
             }
@@ -223,27 +243,61 @@ final class Model: ObservableObject {
                 if d > newest ?? .distantPast { newest = d }
             }
         }
-        return Activity(lastWrite: newest, shells: shellCount(under: sessionPids))
+        return Activity(lastWrite: newest, shells: busyShells(under: sessionPids).values.reduce(0, +))
     }
 
-    // The Bash tool runs each command as a child `/bin/zsh -c source …/shell-snapshots/…` of its
-    // session. MCP servers and Claude Code's own `caffeinate` are children too, so they do not count.
-    private static func shellCount(under pids: Set<Int32>) -> Int {
-        guard !pids.isEmpty else { return 0 }
+    // Busy Bash tool shells per session pid, 0 for a session with none. The Bash tool runs each
+    // command as a child `/bin/zsh -c source …/shell-snapshots/…` of its session. MCP servers and
+    // Claude Code's own `caffeinate` are children too, so they do not count. A shell rests, and is
+    // not busy, when it runs a service (it listens on a TCP port or matches `servicePattern`) and its
+    // whole tree uses less than `restingCPU`. A build, a test or a wait on a deploy stays busy.
+    private static func busyShells(under pids: Set<Int32>) -> [Int32: Int] {
+        guard !pids.isEmpty, let out = output("/bin/ps", ["-axo", "pid=,ppid=,pcpu=,command="]) else { return [:] }
+        var children: [Int32: [Int32]] = [:]
+        var cpu: [Int32: Double] = [:]
+        var command: [Int32: Substring] = [:]
+        var roots: [(pid: Int32, session: Int32)] = []
+        for line in out.split(separator: "\n") {
+            let f = line.split(separator: " ", maxSplits: 3)
+            guard f.count == 4, let pid = Int32(f[0]), let ppid = Int32(f[1]) else { continue }
+            children[ppid, default: []].append(pid)
+            cpu[pid] = Double(f[2]) ?? 0
+            command[pid] = f[3]
+            if pids.contains(ppid), f[3].contains("/shell-snapshots/") { roots.append((pid, ppid)) }
+        }
+        // The root's own command line holds Claude Code's wrapper (`< /dev/null`, the snapshot path),
+        // so only its descendants are matched against `servicePattern`.
+        let trees = roots.map { root -> (session: Int32, pids: [Int32], service: Bool, quiet: Bool) in
+            var tree = [root.pid], i = 0
+            while i < tree.count { tree += children[tree[i]] ?? []; i += 1 }
+            let service = tree.dropFirst().contains {
+                command[$0]?.range(of: servicePattern, options: .regularExpression) != nil
+            }
+            return (root.session, tree, service, tree.reduce(0) { $0 + (cpu[$1] ?? 0) } < restingCPU)
+        }
+        let unsure = trees.filter { $0.quiet && !$0.service }.flatMap(\.pids)
+        let listening = unsure.isEmpty ? [] : Set(
+            (output("/usr/sbin/lsof", ["-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-Fp",
+                                       "-p", unsure.map(String.init).joined(separator: ",")]) ?? "")
+                .split(separator: "\n").compactMap { $0.first == "p" ? Int32($0.dropFirst()) : nil })
+        var busy = Dictionary(uniqueKeysWithValues: pids.map { ($0, 0) })
+        for t in trees where !(t.quiet && (t.service || t.pids.contains(where: listening.contains))) {
+            busy[t.session, default: 0] += 1
+        }
+        return busy
+    }
+
+    private static func output(_ path: String, _ args: [String]) -> String? {
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-        proc.arguments = ["-axo", "ppid=,command="]
+        proc.executableURL = URL(fileURLWithPath: path)
+        proc.arguments = args
         let out = Pipe()
         proc.standardOutput = out
         proc.standardError = FileHandle.nullDevice
-        guard (try? proc.run()) != nil else { return 0 }
+        guard (try? proc.run()) != nil else { return nil }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
-        return String(decoding: data, as: UTF8.self).split(separator: "\n").filter { line in
-            let parts = line.split(separator: " ", maxSplits: 1)
-            guard parts.count == 2, let ppid = Int32(parts[0]) else { return false }
-            return pids.contains(ppid) && parts[1].contains("/shell-snapshots/")
-        }.count
+        return String(decoding: data, as: UTF8.self)
     }
 
     private static func scanSessions() -> [Session] {
@@ -306,6 +360,37 @@ final class Model: ObservableObject {
             return .success(try JSONDecoder().decode(Payload.self, from: data).accounts)
         } catch {
             return .failure(error)
+        }
+    }
+}
+
+// MARK: - Notes
+
+// One page of plain text, saved on every change. The file is read again each time the notes open,
+// so an edit made in another editor is not overwritten.
+final class Notes: ObservableObject {
+    static let defaultFile = URL.applicationSupportDirectory.appending(path: "ClaudeNotch/notes.md")
+
+    let file: URL
+    @Published var text = "" { didSet { if text != saved { save() } } }
+    @Published var problem: String?
+    private var saved = ""
+
+    init(file: URL = defaultFile) { self.file = file }
+
+    func load() {
+        saved = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+        if text != saved { text = saved }
+    }
+
+    private func save() {
+        do {
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try text.write(to: file, atomically: true, encoding: .utf8)
+            saved = text
+            if problem != nil { problem = nil }
+        } catch {
+            problem = "Could not save the notes: \(error.localizedDescription)"
         }
     }
 }
@@ -697,6 +782,66 @@ struct LemburToggle: View {
     }
 }
 
+// Header toggle for the notes: a pencil, lit while the notes are open. No label, so the header
+// still fits the status line beside two toggles.
+struct NotesToggle: View {
+    let on: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "square.and.pencil")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(on ? .black : .white.opacity(hovering ? 0.9 : 0.6))
+                .padding(.horizontal, 7).padding(.vertical, 3)
+                .background(Capsule().fill(on ? .white : .white.opacity(hovering ? 0.14 : 0.08)))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(PressStyle())
+        .onHover { hovering = $0 }
+        .pointerStyle(.link)
+        .animation(.easeOut(duration: 0.14), value: hovering)
+        .help(on ? "Close the notes" : "Notes: write anything, it saves as you type")
+        .accessibilityLabel(on ? "Close notes" : "Notes")
+    }
+}
+
+// The notes page. It takes the keyboard when it opens. Esc or a click outside the notch gives it back.
+struct NotesView: View {
+    @ObservedObject var notes: Notes
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .topLeading) {
+                // TextEditor insets its text by the line fragment padding, 5pt.
+                if notes.text.isEmpty {
+                    Text("Write a note").foregroundStyle(.white.opacity(0.3)).padding(.leading, 5)
+                }
+                TextEditor(text: $notes.text)
+                    .scrollContentBackground(.hidden)
+                    .focused($focused)
+                    .focusEffectDisabled()
+                    .accessibilityLabel("Notes")
+            }
+            .font(.system(size: 12))
+            .foregroundStyle(.white)
+            .padding(8)
+            .frame(height: 260)
+            .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.white.opacity(focused ? 0.22 : 0.1), lineWidth: 1))
+            Text(notes.problem ?? "Saves as you type · Esc to close")
+                .font(.system(size: 9.5))
+                .foregroundStyle(notes.problem == nil ? .white.opacity(0.4) : .orange)
+                .lineLimit(2)
+                .help("Saved in \(notes.file.path)")
+        }
+        .onAppear { focused = true }
+        .transition(.opacity)
+    }
+}
+
 struct AccountRow: View {
     let account: Account
     let working: Int
@@ -819,8 +964,10 @@ struct SessionRow: View {
 
 struct RootView: View {
     @ObservedObject var model: Model
+    let notes: Notes
     let notchWidth: CGFloat
     let notchHeight: CGFloat
+    let setNotes: (Bool) -> Void
     static let wing: CGFloat = 84
     static let maxSessions = 5
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -833,35 +980,40 @@ struct RootView: View {
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.working)
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.needsYou)
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.lembur)
+            .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.notesOpen)
     }
 
     @ViewBuilder private var content: some View {
         if model.expanded {
             VStack(alignment: .leading, spacing: 10) {
                 header
-                if !model.needsYou.isEmpty { sessionList(model.needsYou, tint: askBlue) }
-                if !model.working.isEmpty { sessionList(model.working, tint: claudeOrange) }
-                ForEach(model.accounts) { a in
-                    AccountRow(account: a, working: model.workingCount(account: a.number),
-                               waiting: model.needsYouCount(account: a.number),
-                               targets: model.sessions(account: a.number)) { model.open(account: a.number) }
-                }
-                HStack {
-                    if let notice = model.notice {
-                        Text(notice).foregroundStyle(.orange).lineLimit(2)
-                    } else if let err = model.error {
-                        Text(err).foregroundStyle(.orange).lineLimit(2)
-                    } else if model.lembur {
-                        Text(model.sleepAt == nil ? "Lembur: waiting for every agent to stop"
-                                                  : "Lembur: all quiet. Any activity restarts the countdown")
-                            .foregroundStyle(lemburPurple.opacity(0.8))
-                    } else if let t = model.updatedAt {
-                        Text("updated \(t.formatted(date: .omitted, time: .shortened))")
+                if model.notesOpen {
+                    NotesView(notes: notes)
+                } else {
+                    if !model.needsYou.isEmpty { sessionList(model.needsYou, tint: askBlue) }
+                    if !model.working.isEmpty { sessionList(model.working, tint: claudeOrange) }
+                    ForEach(model.accounts) { a in
+                        AccountRow(account: a, working: model.workingCount(account: a.number),
+                                   waiting: model.needsYouCount(account: a.number),
+                                   targets: model.sessions(account: a.number)) { model.open(account: a.number) }
                     }
-                    Spacer()
+                    HStack {
+                        if let notice = model.notice {
+                            Text(notice).foregroundStyle(.orange).lineLimit(2)
+                        } else if let err = model.error {
+                            Text(err).foregroundStyle(.orange).lineLimit(2)
+                        } else if model.lembur {
+                            Text(model.sleepAt == nil ? "Lembur: waiting for every agent to stop"
+                                                      : "Lembur: all quiet. Any activity restarts the countdown")
+                                .foregroundStyle(lemburPurple.opacity(0.8))
+                        } else if let t = model.updatedAt {
+                            Text("updated \(t.formatted(date: .omitted, time: .shortened))")
+                        }
+                        Spacer()
+                    }
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.white.opacity(0.4))
                 }
-                .font(.system(size: 9.5))
-                .foregroundStyle(.white.opacity(0.4))
             }
             .padding(.top, notchHeight + 8)
             .padding(.horizontal, 16)
@@ -903,7 +1055,10 @@ struct RootView: View {
                 .contentTransition(.opacity)
             }
             Spacer()
-            LemburToggle(on: model.lembur, sleepAt: model.sleepAt) { model.toggleLembur() }
+            HStack(spacing: 6) {
+                NotesToggle(on: model.notesOpen) { setNotes(!model.notesOpen) }
+                LemburToggle(on: model.lembur, sleepAt: model.sleepAt) { model.toggleLembur() }
+            }
         }
         .padding(.bottom, 2)
     }
@@ -977,6 +1132,46 @@ struct RootView: View {
 
 // MARK: - Window
 
+// The panel takes the keyboard only while the notes are open, so a click on a row never takes it
+// from your terminal. As a nonactivating panel it never makes ClaudeNotch the active app.
+final class NotchPanel: NSPanel {
+    var keyable = false
+    var onEscape: (() -> Void)?
+    var onResignKey: (() -> Void)?
+
+    override var canBecomeKey: Bool { keyable }
+
+    override func resignKey() {
+        super.resignKey()
+        onResignKey?()
+    }
+
+    // Esc closes the notes. The text view would otherwise use it to offer word completions.
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, event.keyCode == 53, let onEscape {
+            onEscape()
+            return
+        }
+        super.sendEvent(event)
+    }
+
+    // The app has no menu bar, so the Edit shortcuts that a menu would send to the text go from here.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let action: Selector? = switch (event.modifierFlags.intersection([.command, .shift, .option, .control]),
+                                        event.charactersIgnoringModifiers ?? "") {
+        case ([.command], "x"): #selector(NSText.cut(_:))
+        case ([.command], "c"): #selector(NSText.copy(_:))
+        case ([.command], "v"): #selector(NSText.paste(_:))
+        case ([.command], "a"): #selector(NSText.selectAll(_:))
+        case ([.command], "z"): Selector(("undo:"))
+        case ([.command, .shift], "Z"): Selector(("redo:"))
+        default: nil
+        }
+        if let action, NSApp.sendAction(action, to: nil, from: self) { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 // Once the panel takes mouse events the global monitor goes quiet over it, so the view reports
 // moves itself. First mouse: a click on a row works while another app is frontmost.
 final class HostingView: NSHostingView<RootView> {
@@ -1007,7 +1202,8 @@ final class HostingView: NSHostingView<RootView> {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = Model()
-    var panel: NSPanel!
+    let notes = Notes()
+    var panel: NotchPanel!
     var collapseWork: DispatchWorkItem?
     static let panelSize = CGSize(width: 420, height: 640)
 
@@ -1019,6 +1215,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.refreshSessions()
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.model.refreshSessions() }
         NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { [weak self] _ in self?.trackMouse() }
+        // While the notes hold the keyboard, ClaudeNotch is the active app, so a move can come here
+        // rather than to the app below.
+        NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { [weak self] e in
+            self?.trackMouse()
+            return e
+        }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in self?.buildPanel() }
     }
@@ -1039,17 +1241,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel?.orderOut(nil)
         let size = Self.panelSize
         let f = screen.frame
-        panel = NSPanel(contentRect: NSRect(x: f.midX - size.width / 2, y: f.maxY - size.height,
-                                            width: size.width, height: size.height),
-                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = NotchPanel(contentRect: NSRect(x: f.midX - size.width / 2, y: f.maxY - size.height,
+                                               width: size.width, height: size.height),
+                           styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
         panel.ignoresMouseEvents = true
+        // The shape is always black, so the notes draw their caret and selection for a dark background.
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.keyable = model.notesOpen
+        panel.onEscape = { [weak self] in self?.setNotes(false) }
+        panel.onResignKey = { [weak self] in self?.trackMouse() }
         let n = notchSize
-        let host = HostingView(rootView: RootView(model: model, notchWidth: n.width, notchHeight: n.height))
+        let host = HostingView(rootView: RootView(model: model, notes: notes, notchWidth: n.width,
+                                                  notchHeight: n.height) { [weak self] in self?.setNotes($0) })
         host.onMouseMove = { [weak self] in self?.trackMouse() }
         panel.contentView = host
         panel.orderFrontRegardless()
@@ -1064,6 +1272,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func trackMouse() {
         let inside = hotRect.insetBy(dx: -4, dy: -4).contains(NSEvent.mouseLocation)
+        // While you type a note, the panel holds the keyboard and stays open wherever the pointer goes.
+        let typing = panel.isKeyWindow
         if inside {
             collapseWork?.cancel()
             collapseWork = nil
@@ -1071,7 +1281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 setExpanded(true)
                 model.refresh()
             }
-        } else if model.expanded, collapseWork == nil {
+        } else if model.expanded, collapseWork == nil, !typing {
             let work = DispatchWorkItem { [weak self] in
                 self?.collapseWork = nil
                 self?.setExpanded(false)
@@ -1088,6 +1298,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model.expanded = value
         } else {
             withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) { model.expanded = value }
+        }
+        // The next hover opens on the sessions again, not on the notes.
+        if !value { setNotes(false) }
+    }
+
+    // Opening the notes gives the panel the keyboard. Closing gives it back to the app you were in:
+    // a window gives up the keyboard when it leaves the screen, so the panel steps out and back in.
+    func setNotes(_ open: Bool) {
+        guard open != model.notesOpen else { return }
+        if open { notes.load() }
+        model.notesOpen = open
+        panel.keyable = open
+        if open {
+            panel.makeKey()
+        } else if panel.isKeyWindow {
+            panel.orderOut(nil)
+            panel.orderFrontRegardless()
         }
     }
 }
