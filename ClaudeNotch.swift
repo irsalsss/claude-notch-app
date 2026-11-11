@@ -43,11 +43,13 @@ private struct SessionFile: Decodable {
 struct Limit: Decodable {
     let pct: Double
     let countdown: String?
+    let name: String?  // a scoped limit only: the model it covers, such as "Fable"
 }
 
 struct Usage: Decodable {
     let fiveHour: Limit?
     let sevenDay: Limit?
+    let scoped: [Limit]?  // weekly limits that cover one model each
 }
 
 struct Account: Decodable, Identifiable {
@@ -679,7 +681,8 @@ struct Meter: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(title).frame(width: 22, alignment: .leading).foregroundStyle(.white.opacity(0.5))
+            Text(title).lineLimit(1).minimumScaleFactor(0.8)
+                .frame(width: 34, alignment: .leading).foregroundStyle(.white.opacity(0.5))
             GeometryReader { g in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.white.opacity(0.1))
@@ -891,6 +894,10 @@ struct AccountRow: View {
                 Meter(title: "5h", limit: account.usage?.fiveHour)
                 // Team-plan seats report no 7d window, so the row only shows when the API sends one.
                 if let w = account.usage?.sevenDay { Meter(title: "7d", limit: w) }
+                // One row per model-scoped weekly limit, titled with the model's name ("Fable").
+                ForEach(Array((account.usage?.scoped ?? []).enumerated()), id: \.offset) { _, s in
+                    Meter(title: s.name ?? "model", limit: s)
+                }
             }
             .padding(10)
             .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(background)))
