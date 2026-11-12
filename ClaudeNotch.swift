@@ -675,32 +675,43 @@ final class PulseView: NSView {
     }
 }
 
+// A ring gauge with the % inside and the title + countdown beside it, so every window of an
+// account fits on one row instead of one bar row each.
 struct Meter: View {
     let title: String
     let limit: Limit?  // nil: the API sent no data for this window
 
+    private static let ring: CGFloat = 30
+
     var body: some View {
-        HStack(spacing: 8) {
-            Text(title).lineLimit(1).minimumScaleFactor(0.8)
-                .frame(width: 34, alignment: .leading).foregroundStyle(.white.opacity(0.5))
-            GeometryReader { g in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(.white.opacity(0.1))
-                    if let limit {
-                        let c = color(for: limit.pct)
-                        Capsule()
-                            .fill(LinearGradient(colors: [c.opacity(0.55), c], startPoint: .leading, endPoint: .trailing))
-                            .frame(width: max(4, g.size.width * min(limit.pct, 100) / 100))
-                            .shadow(color: c.opacity(0.5), radius: 3)
-                    }
+        HStack(spacing: 6) {
+            ZStack {
+                Circle().stroke(.white.opacity(0.1), lineWidth: 3)
+                if let limit {
+                    let c = color(for: limit.pct)
+                    Circle()
+                        .trim(from: 0, to: max(0.02, min(limit.pct, 100) / 100))
+                        .stroke(AngularGradient(colors: [c.opacity(0.55), c], center: .center,
+                                                startAngle: .degrees(0), endAngle: .degrees(360 * max(0.02, min(limit.pct, 100) / 100))),
+                                style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .shadow(color: c.opacity(0.5), radius: 2)
                 }
+                Text(limit.map { "\(Int($0.pct.rounded()))" } ?? "–")
+                    .font(.system(size: 9.5, weight: .semibold).monospacedDigit())
             }
-            .frame(height: 6)
-            Text(limit.map { "\(Int($0.pct.rounded()))%" } ?? "–").frame(width: 34, alignment: .trailing)
-            Text(limit?.countdown ?? "").frame(width: 50, alignment: .trailing).foregroundStyle(.white.opacity(0.45))
+            .frame(width: Self.ring, height: Self.ring)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).lineLimit(1).minimumScaleFactor(0.8).foregroundStyle(.white.opacity(0.6))
+                Text(limit?.countdown ?? " ").lineLimit(1).minimumScaleFactor(0.8).foregroundStyle(.white.opacity(0.4))
+            }
+            .font(.system(size: 9.5, weight: .medium).monospacedDigit())
         }
-        .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+        .frame(maxWidth: .infinity, alignment: .leading)
         .foregroundStyle(.white)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(title) \(limit.map { "\(Int($0.pct.rounded())) percent" } ?? "no data")")
+        .accessibilityValue(limit?.countdown ?? "")
     }
 }
 
@@ -891,12 +902,14 @@ struct AccountRow: View {
                 }
                 .frame(height: 18)
                 .foregroundStyle(.white)
-                Meter(title: "5h", limit: account.usage?.fiveHour)
-                // Team-plan seats report no 7d window, so the row only shows when the API sends one.
-                if let w = account.usage?.sevenDay { Meter(title: "7d", limit: w) }
-                // One row per model-scoped weekly limit, titled with the model's name ("Fable").
-                ForEach(Array((account.usage?.scoped ?? []).enumerated()), id: \.offset) { _, s in
-                    Meter(title: s.name ?? "model", limit: s)
+                HStack(spacing: 8) {
+                    Meter(title: "5h", limit: account.usage?.fiveHour)
+                    // Team-plan seats report no 7d window, so the ring only shows when the API sends one.
+                    if let w = account.usage?.sevenDay { Meter(title: "7d", limit: w) }
+                    // One ring per model-scoped weekly limit, titled with the model's name ("Fable").
+                    ForEach(Array((account.usage?.scoped ?? []).enumerated()), id: \.offset) { _, s in
+                        Meter(title: s.name ?? "model", limit: s)
+                    }
                 }
             }
             .padding(10)

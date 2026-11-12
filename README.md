@@ -26,7 +26,7 @@ The collapsed state shows these items:
 
 The default account is the account that a plain `claude` command uses. claude-swap keeps the credentials of this account in `~/.claude`. A terminal tab that you start with `claude-swap run N` uses account `N` instead.
 
-The expanded state shows a blue list of the sessions that wait for your answer. Each row says `question` or `permission`. Below it, the expanded state shows a list of the working sessions. For each session, the list shows the session name, the folder, and the account number. Below the list, a card for each account shows the 5-hour limit, the 7-day limit, and the time until each limit resets. If claude-swap reports a weekly limit for one model, the card shows a row with the name of that model, for example `Fable`. The header has a pencil button for the [notes](#notes) and the `Lembur` button for [mode lembur](#mode-lembur).
+The expanded state shows a blue list of the sessions that wait for your answer. Each row says `question` or `permission`. Below it, the expanded state shows a list of the working sessions. For each session, the list shows the session name, the folder, and the account number. Below the list, a card for each account shows one row of ring gauges: the 5-hour limit, the 7-day limit, and the time until each limit resets. The percentage is inside the ring. If claude-swap reports a weekly limit for one model, the card shows a ring with the name of that model, for example `Fable`. The header has a pencil button for the [notes](#notes) and the `Lembur` button for [mode lembur](#mode-lembur).
 
 If you turn on Reduce Motion in System Settings, the mark does not turn. A glow around the mark then shows that a session is working.
 
@@ -196,7 +196,7 @@ Use this table to find the cause of a problem:
 | Problem | Cause and fix |
 | --- | --- |
 | The expanded state shows an error line. | Run `~/.local/bin/claude-swap list --json` in Terminal. The app reads the same output, so Terminal shows the same error. |
-| A meter shows `–` in place of a percentage. | claude-swap has no usage data for that limit. Team plans do not report a 7-day limit, so the app does not show that row for them. |
+| A meter shows `–` in place of a percentage. | claude-swap has no usage data for that limit. Team plans do not report a 7-day limit, so the app does not show that ring for them. |
 | The mark does not turn while a session works. | Make sure that the session file of that session is in one of the folders in "How the app gets its data". |
 | A click brings the terminal to the front, but not the correct tab. | Open System Settings > Privacy & Security > Automation. Turn on iTerm2 or Terminal under ClaudeNotch. The footer of the expanded state also shows this message. |
 | The notes show `Could not save the notes`. | The app cannot write the notes file. The line shows the reason from macOS. Make sure that your user account can write to `~/Library/Application Support/ClaudeNotch`. |
