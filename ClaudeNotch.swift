@@ -11,6 +11,10 @@ import SwiftUI
 let claudeOrange = Color(red: 0.851, green: 0.467, blue: 0.341)  // #D97757
 let askBlue = Color(red: 0.353, green: 0.659, blue: 1.0)  // #5AA8FF: a session waits for your answer
 let lemburPurple = Color(red: 0.722, green: 0.592, blue: 1.0)  // #B897FF: mode lembur holds the Mac awake
+// Usage levels, muted so they sit with the black shape instead of shouting like system red/green.
+let levelLow = Color(red: 0.494, green: 0.800, blue: 0.627)  // #7ECCA0
+let levelMid = Color(red: 0.925, green: 0.722, blue: 0.341)  // #ECB857
+let levelHigh = Color(red: 0.937, green: 0.427, blue: 0.392)  // #EF6D64
 
 // MARK: - Data
 
@@ -50,6 +54,18 @@ struct Usage: Decodable {
     let fiveHour: Limit?
     let sevenDay: Limit?
     let scoped: [Limit]?  // weekly limits that cover one model each
+}
+
+extension Usage {
+    // Near the weekly cap the shorter windows stop deciding anything. From 90% the 5-hour window
+    // hides; at 100% the per-model weekly limits hide too, since nothing runs until the week resets.
+    // Compared on the rounded % the ring shows, so a ring that reads "100" never sits beside them.
+    // A plan with no weekly window (Team seats) keeps every ring.
+    private var weekly: Int { sevenDay.map { Int($0.pct.rounded()) } ?? 0 }
+    var showsFiveHour: Bool { weekly < 90 }
+    var showsScoped: Bool { weekly < 100 }
+    // The window the collapsed notch reports: the weekly one once the 5-hour one hides.
+    var headline: (title: String, limit: Limit?) { showsFiveHour ? ("5h", fiveHour) : ("7d", sevenDay) }
 }
 
 struct Account: Decodable, Identifiable {
@@ -498,7 +514,41 @@ enum TerminalFocus {
 // MARK: - Views
 
 func color(for pct: Double) -> Color {
-    pct >= 80 ? .red : pct >= 50 ? .yellow : .green
+    pct >= 80 ? levelHigh : pct >= 50 ? levelMid : levelLow
+}
+
+// A raised surface on the black shape: a faint top-lit fill and a hairline that fades downwards,
+// so the light reads as coming from above, like the menu bar's.
+struct Surface: View {
+    var radius: CGFloat = 12
+    var fill: Double = 0.045
+    var tint: Color = .white
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        shape.fill(LinearGradient(colors: [tint.opacity(fill + 0.02), tint.opacity(fill)], startPoint: .top, endPoint: .bottom))
+            .overlay(shape.strokeBorder(LinearGradient(colors: [.white.opacity(0.1), .white.opacity(0.02)],
+                                                       startPoint: .top, endPoint: .bottom), lineWidth: 0.5))
+    }
+}
+
+// Small sentence-case label over a group.
+struct Eyebrow: View {
+    let text: String
+    var count: Int?
+    var tint: Color = .white
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(text)
+            if let count { Text("\(count)").monospacedDigit().foregroundStyle(tint.opacity(0.9)) }
+        }
+        .font(.system(size: 10, weight: .semibold))
+        .tracking(0.1)
+        .foregroundStyle(.white.opacity(0.4))
+        .padding(.leading, 2)
+        .accessibilityAddTraits(.isHeader)
+    }
 }
 
 struct NotchShape: Shape {
@@ -681,31 +731,36 @@ struct Meter: View {
     let title: String
     let limit: Limit?  // nil: the API sent no data for this window
 
-    private static let ring: CGFloat = 30
+    private static let ring: CGFloat = 32
+    private static let line: CGFloat = 2.5
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 7) {
             ZStack {
-                Circle().stroke(.white.opacity(0.1), lineWidth: 3)
+                Circle().stroke(.white.opacity(0.08), lineWidth: Self.line)
                 if let limit {
                     let c = color(for: limit.pct)
+                    let f = max(0.02, min(limit.pct, 100) / 100)
                     Circle()
-                        .trim(from: 0, to: max(0.02, min(limit.pct, 100) / 100))
-                        .stroke(AngularGradient(colors: [c.opacity(0.55), c], center: .center,
-                                                startAngle: .degrees(0), endAngle: .degrees(360 * max(0.02, min(limit.pct, 100) / 100))),
-                                style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                        .trim(from: 0, to: f)
+                        .stroke(AngularGradient(colors: [c.opacity(0.45), c], center: .center,
+                                                startAngle: .degrees(0), endAngle: .degrees(360 * f)),
+                                style: StrokeStyle(lineWidth: Self.line, lineCap: .round))
                         .rotationEffect(.degrees(-90))
-                        .shadow(color: c.opacity(0.5), radius: 2)
+                        .shadow(color: c.opacity(0.45), radius: 3)
                 }
                 Text(limit.map { "\(Int($0.pct.rounded()))" } ?? "–")
-                    .font(.system(size: 9.5, weight: .semibold).monospacedDigit())
+                    .font(.system(size: 10.5, weight: .semibold, design: .rounded).monospacedDigit())
+                    .foregroundStyle(.white.opacity(limit == nil ? 0.35 : 0.95))
             }
             .frame(width: Self.ring, height: Self.ring)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title).lineLimit(1).minimumScaleFactor(0.8).foregroundStyle(.white.opacity(0.6))
-                Text(limit?.countdown ?? " ").lineLimit(1).minimumScaleFactor(0.8).foregroundStyle(.white.opacity(0.4))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 10, weight: .semibold)).foregroundStyle(.white.opacity(0.75))
+                Text(limit?.countdown ?? " ").font(.system(size: 9.5, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.38))
             }
-            .font(.system(size: 9.5, weight: .medium).monospacedDigit())
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .foregroundStyle(.white)
@@ -734,9 +789,9 @@ struct Chip: View {
     var body: some View {
         Text(text)
             .font(.system(size: 9.5, weight: .semibold))
-            .foregroundStyle(tint)
-            .padding(.horizontal, 6).padding(.vertical, 1.5)
-            .background(Capsule().fill(tint.opacity(0.15)))
+            .foregroundStyle(tint.opacity(0.95))
+            .padding(.horizontal, 5).padding(.vertical, 1.5)
+            .background(RoundedRectangle(cornerRadius: 4, style: .continuous).fill(tint.opacity(0.13)))
     }
 }
 
@@ -843,11 +898,12 @@ struct NotesView: View {
             .foregroundStyle(.white)
             .padding(8)
             .frame(height: 260)
-            .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.06)))
-            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.white.opacity(focused ? 0.22 : 0.1), lineWidth: 1))
+            .background(Surface())
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(.white.opacity(focused ? 0.18 : 0), lineWidth: 1))
             Text(notes.problem ?? "Saves as you type · Esc to close")
                 .font(.system(size: 9.5))
-                .foregroundStyle(notes.problem == nil ? .white.opacity(0.4) : .orange)
+                .foregroundStyle(notes.problem == nil ? .white.opacity(0.4) : levelMid)
                 .lineLimit(2)
                 .help("Saved in \(notes.file.path)")
         }
@@ -872,23 +928,23 @@ struct AccountRow: View {
 
     var body: some View {
         Button(action: onOpen) {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 6) {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 7) {
                     Text("\(account.number)")
-                        .font(.system(size: 10.5, weight: .bold).monospacedDigit())
-                        .foregroundStyle(lit ? .black : .white.opacity(0.75))
+                        .font(.system(size: 10.5, weight: .bold, design: .rounded).monospacedDigit())
+                        .foregroundStyle(lit ? .black : .white.opacity(0.8))
                         .frame(width: 18, height: 18)
-                        .background(RoundedRectangle(cornerRadius: 5).fill(lit ? accent : .white.opacity(0.1)))
-                    Text(account.label).font(.system(size: 12, weight: .semibold))
+                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(lit ? accent : .white.opacity(0.1)))
+                    Text(account.label).font(.system(size: 12, weight: .semibold)).tracking(-0.1).lineLimit(1)
                     if account.active {
-                        Chip(text: "default", tint: .green)
+                        Chip(text: "default", tint: .white)
                             .help("Account in ~/.claude: what a plain `claude` runs as. `claude-swap run N` tabs use their own.")
                     }
                     if waiting > 0 { Chip(text: "\(waiting) waiting", tint: askBlue) }
                     if working > 0 { Chip(text: "\(working) working", tint: claudeOrange) }
                     Spacer(minLength: 4)
                     if let status = account.usageStatus, status != "ok" {
-                        Text(status).font(.system(size: 10)).foregroundStyle(.orange)
+                        Text(status).font(.system(size: 10, weight: .medium)).foregroundStyle(levelMid)
                     }
                     if lit, let app {
                         OpenHint(app: targets.count > 1 ? "\(app) · \(targets.count)" : app, tint: accent)
@@ -902,22 +958,22 @@ struct AccountRow: View {
                 }
                 .frame(height: 18)
                 .foregroundStyle(.white)
+                // Empty slots keep every ring in the same column on every card.
+                let shown = meters
                 HStack(spacing: 8) {
-                    Meter(title: "5h", limit: account.usage?.fiveHour)
-                    // Team-plan seats report no 7d window, so the ring only shows when the API sends one.
-                    if let w = account.usage?.sevenDay { Meter(title: "7d", limit: w) }
-                    // One ring per model-scoped weekly limit, titled with the model's name ("Fable").
-                    ForEach(Array((account.usage?.scoped ?? []).enumerated()), id: \.offset) { _, s in
-                        Meter(title: s.name ?? "model", limit: s)
+                    ForEach(Array(shown.enumerated()), id: \.offset) { _, m in Meter(title: m.title, limit: m.limit) }
+                    ForEach(shown.count..<max(shown.count, 3), id: \.self) { _ in
+                        Color.clear.frame(maxWidth: .infinity, maxHeight: 1)
                     }
                 }
             }
-            .padding(10)
-            .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(background)))
-            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(lit ? accent.opacity(0.45) : .clear, lineWidth: 1))
-            .shadow(color: lit ? accent.opacity(0.22) : .clear, radius: 10)
-            .scaleEffect(lit && !reduceMotion ? 1.012 : 1)
-            .contentShape(RoundedRectangle(cornerRadius: 10))
+            .padding(.horizontal, 11).padding(.top, 10).padding(.bottom, 11)
+            .background(Surface(fill: background))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(lit ? accent.opacity(0.45) : .clear, lineWidth: 1))
+            .shadow(color: lit ? accent.opacity(0.2) : .clear, radius: 12)
+            .scaleEffect(lit && !reduceMotion ? 1.01 : 1)
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(PressStyle())
         .disabled(!clickable)
@@ -932,9 +988,22 @@ struct AccountRow: View {
         .accessibilityHint(clickable ? "Opens its terminal" : "No open session")
     }
 
+    private var meters: [(title: String, limit: Limit?)] {
+        let usage = account.usage
+        var out: [(title: String, limit: Limit?)] = []
+        // Hidden once the weekly limit reaches 90% (see `Usage.showsFiveHour`).
+        if usage?.showsFiveHour ?? true { out.append(("5-hour", usage?.fiveHour)) }
+        // Team-plan seats report no 7d window, so the ring only shows when the API sends one.
+        if let w = usage?.sevenDay { out.append(("Weekly", w)) }
+        // One ring per model-scoped weekly limit, titled with the model's name ("Fable").
+        // Hidden once the weekly limit is used up.
+        if usage?.showsScoped ?? true { out += (usage?.scoped ?? []).map { ($0.name ?? "Model", $0) } }
+        return out
+    }
+
     private var background: Double {
-        let base = account.active ? 0.07 : 0.03
-        return hovering ? base + (clickable ? 0.06 : 0.02) : base
+        let base = account.active ? 0.065 : 0.035
+        return hovering ? base + (clickable ? 0.05 : 0.015) : base
     }
 }
 
@@ -970,9 +1039,9 @@ struct SessionRow: View {
                     .foregroundStyle(tint)
                     .opacity(hovering ? 1 : 0)
             }
-            .padding(.horizontal, 6).padding(.vertical, 3)
-            .background(RoundedRectangle(cornerRadius: 6).fill(tint.opacity(hovering ? 0.14 : 0)))
-            .contentShape(RoundedRectangle(cornerRadius: 6))
+            .padding(.horizontal, 7).padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(tint.opacity(hovering ? 0.14 : 0)))
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(PressStyle())
         .onHover { hovering = $0 }
@@ -994,7 +1063,7 @@ struct RootView: View {
 
     var body: some View {
         content
-            .background(NotchShape(radius: model.expanded ? 22 : 9).fill(.black))
+            .background(shape)
             .onGeometryChange(for: CGSize.self) { $0.size } action: { model.contentSize = $0 }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.working)
@@ -1003,42 +1072,42 @@ struct RootView: View {
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.notesOpen)
     }
 
+    // The shape stays pure black so its top edge melts into the hardware notch. Open, it gets a
+    // hairline that fades in towards the bottom and a soft drop shadow, so it lifts off the desktop.
+    private var shape: some View {
+        let open = model.expanded
+        let notch = NotchShape(radius: open ? 24 : 9)
+        return notch.fill(.black)
+            .overlay(notch.stroke(LinearGradient(colors: [.clear, .white.opacity(open ? 0.12 : 0)],
+                                                 startPoint: .top, endPoint: .bottom), lineWidth: 0.75))
+            .shadow(color: .black.opacity(open ? 0.5 : 0), radius: 16, y: 8)
+    }
+
     @ViewBuilder private var content: some View {
         if model.expanded {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 12) {
                 header
+                Rectangle().fill(.white.opacity(0.07)).frame(height: 0.5)
                 if model.notesOpen {
                     NotesView(notes: notes)
                 } else {
-                    if !model.needsYou.isEmpty { sessionList(model.needsYou, tint: askBlue) }
-                    if !model.working.isEmpty { sessionList(model.working, tint: claudeOrange) }
-                    ForEach(model.accounts) { a in
-                        AccountRow(account: a, working: model.workingCount(account: a.number),
-                                   waiting: model.needsYouCount(account: a.number),
-                                   targets: model.sessions(account: a.number)) { model.open(account: a.number) }
-                    }
-                    HStack {
-                        if let notice = model.notice {
-                            Text(notice).foregroundStyle(.orange).lineLimit(2)
-                        } else if let err = model.error {
-                            Text(err).foregroundStyle(.orange).lineLimit(2)
-                        } else if model.lembur {
-                            Text(model.sleepAt == nil ? "Lembur: waiting for every agent to stop"
-                                                      : "Lembur: all quiet. Any activity restarts the countdown")
-                                .foregroundStyle(lemburPurple.opacity(0.8))
-                        } else if let t = model.updatedAt {
-                            Text("updated \(t.formatted(date: .omitted, time: .shortened))")
+                    if !model.needsYou.isEmpty { sessionList("Needs you", model.needsYou, tint: askBlue) }
+                    if !model.working.isEmpty { sessionList("Working", model.working, tint: claudeOrange) }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Eyebrow(text: "Accounts")
+                        ForEach(model.accounts) { a in
+                            AccountRow(account: a, working: model.workingCount(account: a.number),
+                                       waiting: model.needsYouCount(account: a.number),
+                                       targets: model.sessions(account: a.number)) { model.open(account: a.number) }
                         }
-                        Spacer()
                     }
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.white.opacity(0.4))
+                    footer
                 }
             }
-            .padding(.top, notchHeight + 8)
+            .padding(.top, notchHeight + 10)
             .padding(.horizontal, 16)
-            .padding(.bottom, 14)
-            .frame(width: 380)
+            .padding(.bottom, 16)
+            .frame(width: 384)
             .transition(.opacity)
         } else {
             HStack(spacing: 0) {
@@ -1057,15 +1126,15 @@ struct RootView: View {
         let n = model.working.count
         let w = model.needsYou.count
         return HStack(spacing: 10) {
-            ClaudeLogo(working: n > 0, size: 22)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Claude").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+            ClaudeLogo(working: n > 0, size: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Claude").font(.system(size: 14, weight: .semibold)).tracking(-0.2).foregroundStyle(.white)
                 HStack(spacing: 6) {
                     if w > 0 {
-                        Text("Waiting for you · \(w)").foregroundStyle(askBlue)
+                        Text("\(w) waiting for you").foregroundStyle(askBlue)
                     }
                     if n > 0 {
-                        Text("Working · \(n) session\(n == 1 ? "" : "s")").foregroundStyle(claudeOrange)
+                        Text("\(n) working").foregroundStyle(claudeOrange)
                     }
                     if w == 0 && n == 0 {
                         Text("Idle").foregroundStyle(.white.opacity(0.45))
@@ -1080,22 +1149,45 @@ struct RootView: View {
                 LemburToggle(on: model.lembur, sleepAt: model.sleepAt) { model.toggleLembur() }
             }
         }
-        .padding(.bottom, 2)
     }
 
-    private func sessionList(_ list: [Session], tint: Color) -> some View {
+    private func sessionList(_ title: String, _ list: [Session], tint: Color) -> some View {
         let shown = list.prefix(Self.maxSessions)
         let rest = list.count - shown.count
-        return VStack(alignment: .leading, spacing: 2) {
-            ForEach(shown) { s in SessionRow(session: s, account: model.accountOf(s)) { model.open(s) } }
-            if rest > 0 {
-                Text("+\(rest) more").font(.system(size: 10)).foregroundStyle(.white.opacity(0.4)).padding(.leading, 6)
+        return VStack(alignment: .leading, spacing: 6) {
+            Eyebrow(text: title, count: list.count, tint: tint)
+            VStack(alignment: .leading, spacing: 1) {
+                ForEach(shown) { s in SessionRow(session: s, account: model.accountOf(s)) { model.open(s) } }
+                if rest > 0 {
+                    Text("+\(rest) more").font(.system(size: 10)).foregroundStyle(.white.opacity(0.4))
+                        .padding(.leading, 19).padding(.vertical, 2)
+                }
             }
+            .padding(3)
+            .background(Surface(fill: 0.07, tint: tint))
         }
-        .padding(4)
-        .background(RoundedRectangle(cornerRadius: 10).fill(tint.opacity(0.08)))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(tint.opacity(0.22), lineWidth: 1))
         .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    private var footer: some View {
+        HStack(spacing: 6) {
+            if let notice = model.notice {
+                Text(notice).foregroundStyle(levelMid).lineLimit(2)
+            } else if let err = model.error {
+                Text(err).foregroundStyle(levelMid).lineLimit(2)
+            } else if model.lembur {
+                Text(model.sleepAt == nil ? "Lembur: waiting for every agent to stop"
+                                          : "Lembur: all quiet. Any activity restarts the countdown")
+                    .foregroundStyle(lemburPurple.opacity(0.85))
+            } else if let t = model.updatedAt {
+                Circle().fill(levelLow.opacity(0.8)).frame(width: 4, height: 4)
+                Text("Updated \(t.formatted(date: .omitted, time: .shortened))")
+            }
+            Spacer()
+        }
+        .font(.system(size: 9.5, weight: .medium))
+        .foregroundStyle(.white.opacity(0.38))
+        .padding(.leading, 2)
     }
 
     // Left of the notch: the Claude mark, how many sessions are working, and a pulsing blue dot
@@ -1128,23 +1220,33 @@ struct RootView: View {
         .frame(width: Self.wing)
     }
 
-    // Right of the notch: one 5h gauge per account (the active one lit), plus the active account's %.
+    // Right of the notch: one gauge per account (the active one lit), plus the active account's %.
+    // Each gauge reads the account's 5h window, or its weekly one once the 5h one hides on the card.
     private var usageWing: some View {
-        let pct = model.active?.usage?.fiveHour?.pct
+        let head = model.active?.usage?.headline
+        let pct = head?.limit?.pct
         return HStack(spacing: 6) {
             HStack(alignment: .bottom, spacing: 2.5) {
                 ForEach(model.accounts) { a in
-                    let p = a.usage?.fiveHour?.pct ?? 0
+                    let p = a.usage?.headline.limit?.pct ?? 0
                     ZStack(alignment: .bottom) {
-                        Capsule().fill(.white.opacity(0.15))
+                        Capsule().fill(.white.opacity(0.14))
                         Capsule().fill(color(for: p)).frame(height: max(2, 13 * min(p, 100) / 100))
                     }
                     .frame(width: 4, height: 13)
-                    .opacity(a.active ? 1 : 0.45)
+                    .opacity(a.active ? 1 : 0.4)
                 }
             }
-            Text(pct.map { "\(Int($0.rounded()))%" } ?? "–")
-                .foregroundStyle(pct.map(color(for:)) ?? .white.opacity(0.5))
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
+                if let head, head.title != "5h" {
+                    Text(head.title).font(.system(size: 8, weight: .semibold)).foregroundStyle(.white.opacity(0.45))
+                }
+                Text(pct.map { "\(Int($0.rounded()))%" } ?? "–")
+                    .foregroundStyle(pct.map(color(for:)) ?? .white.opacity(0.5))
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(pct.map { "\(head?.title == "7d" ? "Weekly" : "5-hour") usage \(Int($0.rounded())) percent" }
+                                ?? "No usage data")
         }
         .frame(width: Self.wing)
     }
@@ -1225,7 +1327,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let notes = Notes()
     var panel: NotchPanel!
     var collapseWork: DispatchWorkItem?
-    static let panelSize = CGSize(width: 420, height: 640)
+    // Wider and taller than the open shape, so its drop shadow and a long session list both fit.
+    static let panelSize = CGSize(width: 460, height: 760)
 
     func applicationDidFinishLaunching(_ note: Notification) {
         buildPanel()
