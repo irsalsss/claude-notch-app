@@ -5,16 +5,52 @@
 //            read from ~/.claude/sessions and every ~/.claude-swap-backup/sessions/<N-email>/sessions.
 // The one file the app writes is the notes: ~/Library/Application Support/ClaudeNotch/notes.md.
 import AppKit
+import Combine
 import IOKit.pwr_mgt
 import SwiftUI
 
-let claudeOrange = Color(red: 0.851, green: 0.467, blue: 0.341)  // #D97757
-let askBlue = Color(red: 0.353, green: 0.659, blue: 1.0)  // #5AA8FF: a session waits for your answer
-let lemburPurple = Color(red: 0.722, green: 0.592, blue: 1.0)  // #B897FF: mode lembur holds the Mac awake
-// Usage levels, muted so they sit with the black shape instead of shouting like system red/green.
-let levelLow = Color(red: 0.494, green: 0.800, blue: 0.627)  // #7ECCA0
-let levelMid = Color(red: 0.925, green: 0.722, blue: 0.341)  // #ECB857
-let levelHigh = Color(red: 0.937, green: 0.427, blue: 0.392)  // #EF6D64
+// Each colour has a light and a dark value: the light one is deeper, so it keeps its contrast on
+// light glass. Core Animation layers take the fixed brand values, since they sit on black or glow.
+func adaptive(_ light: UInt32, _ dark: UInt32) -> Color {
+    Color(nsColor: NSColor(name: nil) { a in
+        let hex = a.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+        return NSColor(srgbRed: CGFloat(hex >> 16 & 0xFF) / 255, green: CGFloat(hex >> 8 & 0xFF) / 255,
+                       blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
+    })
+}
+
+let brandOrange = NSColor(srgbRed: 0.851, green: 0.467, blue: 0.341, alpha: 1)  // #D97757
+let brandBlue = NSColor(srgbRed: 0.353, green: 0.659, blue: 1.0, alpha: 1)  // #5AA8FF
+let claudeOrange = adaptive(0xBF5A38, 0xD97757)
+let askBlue = adaptive(0x1F6FD6, 0x5AA8FF)  // a session waits for your answer
+let lemburPurple = adaptive(0x7550D6, 0xB897FF)  // mode lembur holds the Mac awake
+// Usage levels, muted so they sit with the glass instead of shouting like system red/green.
+let levelLow = adaptive(0x2A8F5B, 0x7ECCA0)
+let levelMid = adaptive(0xB07812, 0xECB857)
+let levelHigh = adaptive(0xCC3F35, 0xEF6D64)
+// Text on a filled accent: white on the deeper light values, black on the bright dark ones.
+let onAccent = adaptive(0xFFFFFF, 0x000000)
+
+// The appearance of the open panel. The closed notch is always black, like the hardware it hides.
+enum Appearance: String, CaseIterable {
+    case system, light, dark
+
+    var title: String { rawValue.capitalized }
+    var icon: String {
+        switch self {
+        case .system: "circle.lefthalf.filled"
+        case .light: "sun.max"
+        case .dark: "moon"
+        }
+    }
+    var nsAppearance: NSAppearance? {
+        switch self {
+        case .system: nil
+        case .light: NSAppearance(named: .aqua)
+        case .dark: NSAppearance(named: .darkAqua)
+        }
+    }
+}
 
 // MARK: - Data
 
@@ -101,6 +137,17 @@ final class Model: ObservableObject {
     @Published var sessions: [Session] = []
     @Published var notice: String?
     @Published var notesOpen = false
+    @Published var appearance = Appearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system {
+        didSet { UserDefaults.standard.set(appearance.rawValue, forKey: "appearance") }
+    }
+    // Account numbers whose card is folded to one row. Kept across launches.
+    @Published var minimized = Set(UserDefaults.standard.array(forKey: "minimizedAccounts") as? [Int] ?? []) {
+        didSet { UserDefaults.standard.set(minimized.sorted(), forKey: "minimizedAccounts") }
+    }
+
+    func toggleMinimized(_ account: Int) {
+        if minimized.remove(account) == nil { minimized.insert(account) }
+    }
 
     // Mode lembur: one-shot. It holds the Mac awake until every agent on this Mac stops, then sleeps it.
     @Published var lembur = false
@@ -517,18 +564,90 @@ func color(for pct: Double) -> Color {
     pct >= 80 ? levelHigh : pct >= 50 ? levelMid : levelLow
 }
 
-// A raised surface on the black shape: a faint top-lit fill and a hairline that fades downwards,
-// so the light reads as coming from above, like the menu bar's.
+// A raised surface on the glass: a top-lit fill and a hairline that fades downwards, so the light
+// reads as coming from above, like the menu bar's. A neutral surface is white in both appearances,
+// faint on dark glass and frosted on light glass; a tinted one keeps its tint.
 struct Surface: View {
     var radius: CGFloat = 12
     var fill: Double = 0.045
-    var tint: Color = .white
+    var tint: Color?
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
-        shape.fill(LinearGradient(colors: [tint.opacity(fill + 0.02), tint.opacity(fill)], startPoint: .top, endPoint: .bottom))
-            .overlay(shape.strokeBorder(LinearGradient(colors: [.white.opacity(0.1), .white.opacity(0.02)],
-                                                       startPoint: .top, endPoint: .bottom), lineWidth: 0.5))
+        let dark = scheme == .dark
+        let base = tint ?? .white
+        let amount = tint == nil && !dark ? min(0.75, fill * 9) : fill
+        let edge: [Color] = dark ? [.white.opacity(0.1), .white.opacity(0.02)] : [.white.opacity(0.9), .white.opacity(0.35)]
+        shape.fill(LinearGradient(colors: [base.opacity(amount + 0.02), base.opacity(amount)], startPoint: .top, endPoint: .bottom))
+            .overlay(shape.strokeBorder(LinearGradient(colors: edge, startPoint: .top, endPoint: .bottom), lineWidth: 0.5))
+    }
+}
+
+// The open panel's material: Liquid Glass on macOS 26 and later, a behind-window blur before it.
+// A light tint keeps the text legible over a busy wallpaper.
+struct GlassBackground<S: Shape>: View {
+    let shape: S
+    @Environment(\.colorScheme) private var scheme
+
+    private var tint: Color { scheme == .dark ? .black.opacity(0.35) : .white.opacity(0.45) }
+
+    var body: some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26, *) {
+            Color.clear.glassEffect(.regular.tint(tint), in: shape)
+        } else {
+            fallback
+        }
+        #else
+        fallback
+        #endif
+    }
+
+    private var fallback: some View {
+        BlurView().clipShape(shape).overlay(shape.fill(tint))
+    }
+}
+
+struct BlurView: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .popover
+        v.blendingMode = .behindWindow
+        v.state = .active  // the panel never becomes the active app, so the blur must not wait for it
+        return v
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
+}
+
+// System, light or dark for the open panel, as three icon buttons.
+struct AppearancePicker: View {
+    @Binding var value: Appearance
+
+    var body: some View {
+        HStack(spacing: 1) {
+            ForEach(Appearance.allCases, id: \.self) { a in
+                let on = value == a
+                Button { value = a } label: {
+                    Image(systemName: a.icon)
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(Color.primary.opacity(on ? 0.9 : 0.4))
+                        .frame(width: 22, height: 17)
+                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(Color.primary.opacity(on ? 0.12 : 0)))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PressStyle())
+                .pointerStyle(.link)
+                .help(a == .system ? "Follow the system appearance" : "\(a.title) appearance")
+                .accessibilityLabel(a == .system ? "Follow the system appearance" : "\(a.title) appearance")
+                .accessibilityAddTraits(on ? .isSelected : [])
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.primary.opacity(0.06)))
+        .animation(.easeOut(duration: 0.14), value: value)
     }
 }
 
@@ -536,7 +655,7 @@ struct Surface: View {
 struct Eyebrow: View {
     let text: String
     var count: Int?
-    var tint: Color = .white
+    var tint: Color = .primary
 
     var body: some View {
         HStack(spacing: 5) {
@@ -545,7 +664,7 @@ struct Eyebrow: View {
         }
         .font(.system(size: 10, weight: .semibold))
         .tracking(0.1)
-        .foregroundStyle(.white.opacity(0.4))
+        .foregroundStyle(Color.primary.opacity(0.4))
         .padding(.leading, 2)
         .accessibilityAddTraits(.isHeader)
     }
@@ -626,8 +745,8 @@ final class MarkView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        shape.fillColor = NSColor(claudeOrange).cgColor
-        shape.shadowColor = NSColor(claudeOrange).cgColor
+        shape.fillColor = brandOrange.cgColor
+        shape.shadowColor = brandOrange.cgColor
         shape.shadowOffset = .zero
         layer?.addSublayer(shape)
     }
@@ -688,8 +807,8 @@ final class PulseView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        dot.backgroundColor = NSColor(askBlue).cgColor
-        dot.shadowColor = NSColor(askBlue).cgColor
+        dot.backgroundColor = brandBlue.cgColor
+        dot.shadowColor = brandBlue.cgColor
         dot.shadowOffset = .zero
         dot.shadowOpacity = 0.9
         layer?.addSublayer(dot)
@@ -737,7 +856,7 @@ struct Meter: View {
     var body: some View {
         HStack(spacing: 7) {
             ZStack {
-                Circle().stroke(.white.opacity(0.08), lineWidth: Self.line)
+                Circle().stroke(Color.primary.opacity(0.08), lineWidth: Self.line)
                 if let limit {
                     let c = color(for: limit.pct)
                     let f = max(0.02, min(limit.pct, 100) / 100)
@@ -751,19 +870,19 @@ struct Meter: View {
                 }
                 Text(limit.map { "\(Int($0.pct.rounded()))" } ?? "–")
                     .font(.system(size: 10.5, weight: .semibold, design: .rounded).monospacedDigit())
-                    .foregroundStyle(.white.opacity(limit == nil ? 0.35 : 0.95))
+                    .foregroundStyle(Color.primary.opacity(limit == nil ? 0.35 : 0.95))
             }
             .frame(width: Self.ring, height: Self.ring)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 10, weight: .semibold)).foregroundStyle(.white.opacity(0.75))
+                Text(title).font(.system(size: 10, weight: .semibold)).foregroundStyle(Color.primary.opacity(0.75))
                 Text(limit?.countdown ?? " ").font(.system(size: 9.5, weight: .medium).monospacedDigit())
-                    .foregroundStyle(.white.opacity(0.38))
+                    .foregroundStyle(Color.primary.opacity(0.38))
             }
             .lineLimit(1)
             .minimumScaleFactor(0.8)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .foregroundStyle(.white)
+        .foregroundStyle(.primary)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(title) \(limit.map { "\(Int($0.pct.rounded())) percent" } ?? "no data")")
         .accessibilityValue(limit?.countdown ?? "")
@@ -834,9 +953,9 @@ struct LemburToggle: View {
                 }
             }
             .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(on ? .black : .white.opacity(hovering ? 0.9 : 0.6))
+            .foregroundStyle(on ? onAccent : Color.primary.opacity(hovering ? 0.9 : 0.6))
             .padding(.horizontal, 8).padding(.vertical, 3)
-            .background(Capsule().fill(on ? lemburPurple : .white.opacity(hovering ? 0.14 : 0.08)))
+            .background(Capsule().fill(on ? lemburPurple : Color.primary.opacity(hovering ? 0.14 : 0.08)))
             .shadow(color: on ? lemburPurple.opacity(0.5) : .clear, radius: 6)
             .contentShape(Capsule())
         }
@@ -862,9 +981,9 @@ struct NotesToggle: View {
         Button(action: action) {
             Image(systemName: "square.and.pencil")
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(on ? .black : .white.opacity(hovering ? 0.9 : 0.6))
+                .foregroundStyle(on ? onAccent : Color.primary.opacity(hovering ? 0.9 : 0.6))
                 .padding(.horizontal, 7).padding(.vertical, 3)
-                .background(Capsule().fill(on ? .white : .white.opacity(hovering ? 0.14 : 0.08)))
+                .background(Capsule().fill(on ? Color.primary : Color.primary.opacity(hovering ? 0.14 : 0.08)))
                 .contentShape(Capsule())
         }
         .buttonStyle(PressStyle())
@@ -886,7 +1005,7 @@ struct NotesView: View {
             ZStack(alignment: .topLeading) {
                 // TextEditor insets its text by the line fragment padding, 5pt.
                 if notes.text.isEmpty {
-                    Text("Write a note").foregroundStyle(.white.opacity(0.3)).padding(.leading, 5)
+                    Text("Write a note").foregroundStyle(Color.primary.opacity(0.3)).padding(.leading, 5)
                 }
                 TextEditor(text: $notes.text)
                     .scrollContentBackground(.hidden)
@@ -895,15 +1014,15 @@ struct NotesView: View {
                     .accessibilityLabel("Notes")
             }
             .font(.system(size: 12))
-            .foregroundStyle(.white)
+            .foregroundStyle(.primary)
             .padding(8)
             .frame(height: 260)
             .background(Surface())
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(.white.opacity(focused ? 0.18 : 0), lineWidth: 1))
+                .strokeBorder(Color.primary.opacity(focused ? 0.18 : 0), lineWidth: 1))
             Text(notes.problem ?? "Saves as you type · Esc to close")
                 .font(.system(size: 9.5))
-                .foregroundStyle(notes.problem == nil ? .white.opacity(0.4) : levelMid)
+                .foregroundStyle(notes.problem == nil ? Color.primary.opacity(0.4) : levelMid)
                 .lineLimit(2)
                 .help("Saved in \(notes.file.path)")
         }
@@ -912,18 +1031,65 @@ struct NotesView: View {
     }
 }
 
+// One limit of a minimized card: its short title, then the % in its level colour.
+struct MiniValue: View {
+    let title: String
+    let limit: Limit?
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 3) {
+            Text(title).font(.system(size: 9.5, weight: .medium)).foregroundStyle(Color.primary.opacity(0.45))
+            Text(limit.map { "\(Int($0.pct.rounded()))" } ?? "–")
+                .font(.system(size: 11, weight: .semibold, design: .rounded).monospacedDigit())
+                .foregroundStyle(limit.map { color(for: $0.pct) } ?? Color.primary.opacity(0.35))
+        }
+        .lineLimit(1)
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(title) \(limit.map { "\(Int($0.pct.rounded())) percent" } ?? "no data")")
+    }
+}
+
+// Folds an account card to one row and back.
+struct MinimizeButton: View {
+    let minimized: Bool
+    let account: Int
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: minimized ? "chevron.down" : "chevron.up")
+                .font(.system(size: 8.5, weight: .bold))
+                .foregroundStyle(Color.primary.opacity(hovering ? 0.85 : 0.4))
+                .frame(width: 18, height: 18)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.primary.opacity(hovering ? 0.12 : 0)))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PressStyle())
+        .onHover { hovering = $0 }
+        .pointerStyle(.link)
+        .animation(.easeOut(duration: 0.14), value: hovering)
+        .help(minimized ? "Show the rings" : "Fold to one row")
+        .accessibilityLabel(minimized ? "Expand account \(account)" : "Minimize account \(account)")
+    }
+}
+
 struct AccountRow: View {
     let account: Account
     let working: Int
     let waiting: Int
     let targets: [Session]  // open sessions of this account, working first
+    let minimized: Bool
     let onOpen: () -> Void
+    let onMinimize: () -> Void
     @State private var hovering = false
     @State private var app: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var clickable: Bool { !targets.isEmpty }
-    private var accent: Color { waiting > 0 ? askBlue : working > 0 ? claudeOrange : .white }
+    private var accent: Color { waiting > 0 ? askBlue : working > 0 ? claudeOrange : Color.primary }
     private var lit: Bool { hovering && clickable }
 
     var body: some View {
@@ -932,51 +1098,74 @@ struct AccountRow: View {
                 HStack(spacing: 7) {
                     Text("\(account.number)")
                         .font(.system(size: 10.5, weight: .bold, design: .rounded).monospacedDigit())
-                        .foregroundStyle(lit ? .black : .white.opacity(0.8))
+                        .foregroundStyle(lit ? onAccent : Color.primary.opacity(0.8))
                         .frame(width: 18, height: 18)
-                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(lit ? accent : .white.opacity(0.1)))
+                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(lit ? accent : Color.primary.opacity(0.1)))
                     Text(account.label).font(.system(size: 12, weight: .semibold)).tracking(-0.1).lineLimit(1)
-                    if account.active {
-                        Chip(text: "default", tint: .white)
-                            .help("Account in ~/.claude: what a plain `claude` runs as. `claude-swap run N` tabs use their own.")
-                    }
-                    if waiting > 0 { Chip(text: "\(waiting) waiting", tint: askBlue) }
-                    if working > 0 { Chip(text: "\(working) working", tint: claudeOrange) }
-                    Spacer(minLength: 4)
-                    if let status = account.usageStatus, status != "ok" {
-                        Text(status).font(.system(size: 10, weight: .medium)).foregroundStyle(levelMid)
-                    }
-                    if lit, let app {
-                        OpenHint(app: targets.count > 1 ? "\(app) · \(targets.count)" : app, tint: accent)
-                            .transition(.opacity.combined(with: .offset(x: reduceMotion ? 0 : 6)))
-                    } else if hovering && !clickable {
-                        Text("no open session")
-                            .font(.system(size: 9.5, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.35))
-                            .transition(.opacity)
+                    if minimized {
+                        // One row: who waits or works is a dot, every limit is a number.
+                        if waiting > 0 { statusDot(askBlue, "\(waiting) waiting") }
+                        if working > 0 { statusDot(claudeOrange, "\(working) working") }
+                        Spacer(minLength: 4)
+                        if account.usage == nil, let status = account.usageStatus, status != "ok" {
+                            Text(status).font(.system(size: 10, weight: .medium)).foregroundStyle(levelMid)
+                        } else {
+                            HStack(spacing: 9) {
+                                ForEach(Array(meters.enumerated()), id: \.offset) { _, m in MiniValue(title: m.short, limit: m.limit) }
+                            }
+                        }
+                    } else {
+                        if account.active {
+                            Chip(text: "default", tint: .primary)
+                                .help("Account in ~/.claude: what a plain `claude` runs as. `claude-swap run N` tabs use their own.")
+                        }
+                        if waiting > 0 { Chip(text: "\(waiting) waiting", tint: askBlue) }
+                        if working > 0 { Chip(text: "\(working) working", tint: claudeOrange) }
+                        Spacer(minLength: 4)
+                        if let status = account.usageStatus, status != "ok" {
+                            Text(status).font(.system(size: 10, weight: .medium)).foregroundStyle(levelMid)
+                        }
+                        if lit, let app {
+                            OpenHint(app: targets.count > 1 ? "\(app) · \(targets.count)" : app, tint: accent)
+                                .transition(.opacity.combined(with: .offset(x: reduceMotion ? 0 : 6)))
+                        } else if hovering && !clickable {
+                            Text("no open session")
+                                .font(.system(size: 9.5, weight: .medium))
+                                .foregroundStyle(Color.primary.opacity(0.35))
+                                .transition(.opacity)
+                        }
                     }
                 }
                 .frame(height: 18)
-                .foregroundStyle(.white)
-                // Empty slots keep every ring in the same column on every card.
-                let shown = meters
-                HStack(spacing: 8) {
-                    ForEach(Array(shown.enumerated()), id: \.offset) { _, m in Meter(title: m.title, limit: m.limit) }
-                    ForEach(shown.count..<max(shown.count, 3), id: \.self) { _ in
-                        Color.clear.frame(maxWidth: .infinity, maxHeight: 1)
+                .padding(.trailing, Self.toggleRoom)  // the minimize button sits over this corner
+                .foregroundStyle(.primary)
+                if !minimized {
+                    // Empty slots keep every ring in the same column on every card.
+                    let shown = meters
+                    HStack(spacing: 8) {
+                        ForEach(Array(shown.enumerated()), id: \.offset) { _, m in Meter(title: m.title, limit: m.limit) }
+                        ForEach(shown.count..<max(shown.count, 3), id: \.self) { _ in
+                            Color.clear.frame(maxWidth: .infinity, maxHeight: 1)
+                        }
                     }
+                    .transition(.opacity)
                 }
             }
-            .padding(.horizontal, 11).padding(.top, 10).padding(.bottom, 11)
+            .padding(.horizontal, 11).padding(.top, 10).padding(.bottom, minimized ? 10 : 11)
             .background(Surface(fill: background))
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(lit ? accent.opacity(0.45) : .clear, lineWidth: 1))
             .shadow(color: lit ? accent.opacity(0.2) : .clear, radius: 12)
-            .scaleEffect(lit && !reduceMotion ? 1.01 : 1)
             .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(PressStyle())
         .disabled(!clickable)
+        // Over the card, not inside its label, so its click never opens the terminal.
+        .overlay(alignment: .topTrailing) {
+            MinimizeButton(minimized: minimized, account: account.number, action: onMinimize)
+                .padding(.top, 10).padding(.trailing, 8)
+        }
+        .scaleEffect(lit && !reduceMotion ? 1.01 : 1)
         .onHover { inside in
             if inside, let first = targets.first { app = TerminalFocus.app(first.pid)?.localizedName ?? "Terminal" }
             hovering = inside
@@ -988,16 +1177,23 @@ struct AccountRow: View {
         .accessibilityHint(clickable ? "Opens its terminal" : "No open session")
     }
 
-    private var meters: [(title: String, limit: Limit?)] {
+    static let toggleRoom: CGFloat = 22
+
+    private func statusDot(_ tint: Color, _ label: String) -> some View {
+        Circle().fill(tint).frame(width: 6, height: 6).help(label).accessibilityLabel(label)
+    }
+
+    // `short` titles the one-row value of a minimized card.
+    private var meters: [(title: String, short: String, limit: Limit?)] {
         let usage = account.usage
-        var out: [(title: String, limit: Limit?)] = []
+        var out: [(title: String, short: String, limit: Limit?)] = []
         // Hidden once the weekly limit reaches 90% (see `Usage.showsFiveHour`).
-        if usage?.showsFiveHour ?? true { out.append(("5-hour", usage?.fiveHour)) }
+        if usage?.showsFiveHour ?? true { out.append(("5-hour", "5h", usage?.fiveHour)) }
         // Team-plan seats report no 7d window, so the ring only shows when the API sends one.
-        if let w = usage?.sevenDay { out.append(("Weekly", w)) }
+        if let w = usage?.sevenDay { out.append(("Weekly", "7d", w)) }
         // One ring per model-scoped weekly limit, titled with the model's name ("Fable").
         // Hidden once the weekly limit is used up.
-        if usage?.showsScoped ?? true { out += (usage?.scoped ?? []).map { ($0.name ?? "Model", $0) } }
+        if usage?.showsScoped ?? true { out += (usage?.scoped ?? []).map { ($0.name ?? "Model", $0.name ?? "Model", $0) } }
         return out
     }
 
@@ -1024,15 +1220,15 @@ struct SessionRow: View {
             HStack(spacing: 7) {
                 Circle().fill(tint).frame(width: 5, height: 5)
                     .shadow(color: tint.opacity(hovering ? 0.9 : 0), radius: 3)
-                Text(session.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
-                Text(session.folder).font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.45)).lineLimit(1)
+                Text(session.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(.primary)
+                Text(session.folder).font(.system(size: 10.5)).foregroundStyle(Color.primary.opacity(0.45)).lineLimit(1)
                 Spacer()
                 if let label {
                     Text(label).font(.system(size: 9.5)).foregroundStyle(tint.opacity(0.85))
                 }
                 if let n = account {
                     Text("#\(n)").font(.system(size: 9.5, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.white.opacity(0.4))
+                        .foregroundStyle(Color.primary.opacity(0.4))
                 }
                 Image(systemName: "arrow.up.right")
                     .font(.system(size: 9, weight: .bold))
@@ -1070,24 +1266,24 @@ struct RootView: View {
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.needsYou)
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.lembur)
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.notesOpen)
+            .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.82), value: model.minimized)
     }
 
-    // The shape stays pure black so its top edge melts into the hardware notch. Open, it gets a
-    // hairline that fades in towards the bottom and a soft drop shadow, so it lifts off the desktop.
-    private var shape: some View {
-        let open = model.expanded
-        let notch = NotchShape(radius: open ? 24 : 9)
-        return notch.fill(.black)
-            .overlay(notch.stroke(LinearGradient(colors: [.clear, .white.opacity(open ? 0.12 : 0)],
-                                                 startPoint: .top, endPoint: .bottom), lineWidth: 0.75))
-            .shadow(color: .black.opacity(open ? 0.5 : 0), radius: 16, y: 8)
+    // Closed, the shape is black like the hardware it hides. Open, it is glass up to the top edge,
+    // and the hardware notch reads as a cutout in it.
+    @ViewBuilder private var shape: some View {
+        if model.expanded {
+            GlassBackground(shape: NotchShape(radius: 24)).transition(.opacity)
+        } else {
+            NotchShape(radius: 9).fill(.black).transition(.opacity)
+        }
     }
 
     @ViewBuilder private var content: some View {
         if model.expanded {
             VStack(alignment: .leading, spacing: 12) {
                 header
-                Rectangle().fill(.white.opacity(0.07)).frame(height: 0.5)
+                Rectangle().fill(Color.primary.opacity(0.07)).frame(height: 0.5)
                 if model.notesOpen {
                     NotesView(notes: notes)
                 } else {
@@ -1098,13 +1294,16 @@ struct RootView: View {
                         ForEach(model.accounts) { a in
                             AccountRow(account: a, working: model.workingCount(account: a.number),
                                        waiting: model.needsYouCount(account: a.number),
-                                       targets: model.sessions(account: a.number)) { model.open(account: a.number) }
+                                       targets: model.sessions(account: a.number),
+                                       minimized: model.minimized.contains(a.number),
+                                       onOpen: { model.open(account: a.number) },
+                                       onMinimize: { model.toggleMinimized(a.number) })
                         }
                     }
                     footer
                 }
             }
-            .padding(.top, notchHeight + 10)
+            .padding(.top, notchHeight + 12)
             .padding(.horizontal, 16)
             .padding(.bottom, 16)
             .frame(width: 384)
@@ -1117,6 +1316,7 @@ struct RootView: View {
             }
             .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
             .foregroundStyle(.white)
+            .environment(\.colorScheme, .dark)  // the wings sit on black whatever the appearance
             .frame(height: notchHeight)
             .transition(.opacity)
         }
@@ -1128,7 +1328,7 @@ struct RootView: View {
         return HStack(spacing: 10) {
             ClaudeLogo(working: n > 0, size: 24)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Claude").font(.system(size: 14, weight: .semibold)).tracking(-0.2).foregroundStyle(.white)
+                Text("Claude").font(.system(size: 14, weight: .semibold)).tracking(-0.2).foregroundStyle(.primary)
                 HStack(spacing: 6) {
                     if w > 0 {
                         Text("\(w) waiting for you").foregroundStyle(askBlue)
@@ -1137,7 +1337,7 @@ struct RootView: View {
                         Text("\(n) working").foregroundStyle(claudeOrange)
                     }
                     if w == 0 && n == 0 {
-                        Text("Idle").foregroundStyle(.white.opacity(0.45))
+                        Text("Idle").foregroundStyle(Color.primary.opacity(0.45))
                     }
                 }
                 .font(.system(size: 10.5, weight: .medium))
@@ -1159,7 +1359,7 @@ struct RootView: View {
             VStack(alignment: .leading, spacing: 1) {
                 ForEach(shown) { s in SessionRow(session: s, account: model.accountOf(s)) { model.open(s) } }
                 if rest > 0 {
-                    Text("+\(rest) more").font(.system(size: 10)).foregroundStyle(.white.opacity(0.4))
+                    Text("+\(rest) more").font(.system(size: 10)).foregroundStyle(Color.primary.opacity(0.4))
                         .padding(.leading, 19).padding(.vertical, 2)
                 }
             }
@@ -1184,9 +1384,10 @@ struct RootView: View {
                 Text("Updated \(t.formatted(date: .omitted, time: .shortened))")
             }
             Spacer()
+            AppearancePicker(value: $model.appearance)
         }
         .font(.system(size: 9.5, weight: .medium))
-        .foregroundStyle(.white.opacity(0.38))
+        .foregroundStyle(Color.primary.opacity(0.38))
         .padding(.leading, 2)
     }
 
@@ -1230,7 +1431,7 @@ struct RootView: View {
                 ForEach(model.accounts) { a in
                     let p = a.usage?.headline.limit?.pct ?? 0
                     ZStack(alignment: .bottom) {
-                        Capsule().fill(.white.opacity(0.14))
+                        Capsule().fill(Color.primary.opacity(0.14))
                         Capsule().fill(color(for: p)).frame(height: max(2, 13 * min(p, 100) / 100))
                     }
                     .frame(width: 4, height: 13)
@@ -1239,10 +1440,10 @@ struct RootView: View {
             }
             HStack(alignment: .firstTextBaseline, spacing: 2) {
                 if let head, head.title != "5h" {
-                    Text(head.title).font(.system(size: 8, weight: .semibold)).foregroundStyle(.white.opacity(0.45))
+                    Text(head.title).font(.system(size: 8, weight: .semibold)).foregroundStyle(Color.primary.opacity(0.45))
                 }
                 Text(pct.map { "\(Int($0.rounded()))%" } ?? "–")
-                    .foregroundStyle(pct.map(color(for:)) ?? .white.opacity(0.5))
+                    .foregroundStyle(pct.map(color(for:)) ?? Color.primary.opacity(0.5))
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(pct.map { "\(head?.title == "7d" ? "Weekly" : "5-hour") usage \(Int($0.rounded())) percent" }
@@ -1327,11 +1528,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let notes = Notes()
     var panel: NotchPanel!
     var collapseWork: DispatchWorkItem?
+    var appearanceSink: AnyCancellable?
     // Wider and taller than the open shape, so its drop shadow and a long session list both fit.
     static let panelSize = CGSize(width: 460, height: 760)
 
     func applicationDidFinishLaunching(_ note: Notification) {
         buildPanel()
+        appearanceSink = model.$appearance.dropFirst().sink { [weak self] in self?.panel.appearance = $0.nsAppearance }
         model.refresh()
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.model.refresh() }
         // Session files are a handful of tiny JSON reads, so a 1s poll keeps the logo honest.
@@ -1373,8 +1576,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isOpaque = false
         panel.hasShadow = false
         panel.ignoresMouseEvents = true
-        // The shape is always black, so the notes draw their caret and selection for a dark background.
-        panel.appearance = NSAppearance(named: .darkAqua)
+        // nil follows the system. The notes draw their caret and selection for this appearance.
+        panel.appearance = model.appearance.nsAppearance
         panel.keyable = model.notesOpen
         panel.onEscape = { [weak self] in self?.setNotes(false) }
         panel.onResignKey = { [weak self] in self?.trackMouse() }
